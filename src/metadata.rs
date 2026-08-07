@@ -26,7 +26,6 @@ pub struct Manifest {
     pub packages: HashMap<String, ManifestPkg>,
     #[serde(default)]
     pub profiles: HashMap<String, Vec<String>>,
-    // поле checksum удалено, так как не используется
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -46,7 +45,6 @@ pub struct RepoPkg {
 #[derive(Debug, Deserialize)]
 pub struct RepoIndex {
     pub packages: HashMap<String, RepoPkg>,
-    // поле updated_at удалено, так как не используется
 }
 
 pub fn parse_package_name(filename: &str) -> (String, String) {

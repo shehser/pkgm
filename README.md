@@ -1,108 +1,120 @@
-# pkgm — Package Manager in Rust
+# pkgm — Package Manager
 
-`pkgm` is a lightweight Unix-like package manager written in Rust. It manages compressed software archives (`.pkg.tar.gz`), maintains a local JSON database of installed files, and handles file conflicts and package updates.
-
----
+`pkgm` is a lightweight package manager written in Rust. It supports installing, removing, updating packages, managing repositories, searching, verifying integrity, and declarative synchronization.
 
 ## Features
 
-- **Install / Upgrade:** Install `.pkg.tar.gz` packages or upgrade existing ones.
-- **Conflict Detection:** Automatic file conflict detection prior to installation.
-- **Footprint Inspection:** Inspect permissions, users, and contents of package archives without extracting.
-- **Unpack Utility:** Extract archive contents into any target directory without registering in DB.
-- **File Ownership Query:** Find which installed package owns a specific file using regex matching.
+- Install/upgrade packages from local files or remote repositories
+- Remove packages safely (keeps shared files)
+- Repository management (HTTP/HTTPS)
+- Search packages by name or description
+- Declarative sync with `pkgm.toml` (`apply` and `update`)
+- Verify integrity with SHA256 checksums
+- Footprint inspection with permissions and owners
+- Unpack archives without touching database
+- File ownership query with regex
 
----
+## Installation
 
-## Project Structure
-
-```text
-pkgutil/
-├── Cargo.toml
-└── src/
-    ├── main.rs       # CLI interface & argument parsing (clap)
-    ├── metadata.rs   # Package metadata and name parsing
-    ├── pkgadd.rs     # Package installation logic
-    ├── pkginfo.rs    # Database & archive query logic
-    ├── pkgrm.rs      # Package removal logic
-    └── pkgutil.rs    # Core utilities (archive unpacking, DB operations)
-
-## Building & Installation
-
-### Prerequisites
-- [Rust & Cargo](https://www.rust-lang.org/) (latest stable version)
-
-### Build from Source
-1. Clone the repository:
-   ```bash
-   git clone [https://github.com/your-username/pkgm.git](https://github.com/your-username/pkgm.git)
-   cd pkgm
-   ```
-
-2. Build and install binary into your `~/.cargo/bin`:
-   ```bash
-   cargo install --path .
-   ```
-
-3. Or build release executable without installing:
-   ```bash
-   cargo build --release
-   # Binary will be located at ./target/release/pkgm
-   ```
-
-
-## Usage Examples
-
-### 1. Installation & Upgrade (`install`)
-Install a package into a custom root directory (`<path>`):
 ```bash
-pkgm -r <path> install <pkg_archive>
+git clone https://github.com/shehser/pkgm.git
+cd pkgm
+cargo build --release
+sudo cp target/release/pkgm /usr/local/bin/
 ```
 
-Upgrade an already installed package:
+Or install via Cargo:
+
 ```bash
-pkgm -r <path> install -u <pkg_archive>
+cargo install --path .
 ```
 
-Force installation (overwrite conflicting files):
-```bash
-pkgm -r <path> install -f <pkg_archive>
+## Configuration
+
+### Repositories (`repos.toml`)
+
+```toml
+main = "https://repo.example.com"
+custom = "http://myrepo.local"
 ```
 
-### 2. Database & Package Inspection (`info`)
-List all installed packages:
-```bash
-pkgm -r <path> info -i
+### Manifest (`pkgm.toml`)
+
+```toml
+[packages]
+nginx = { url = "https://repo.example.com/nginx-1.24.pkg.tar.gz", version = "1.24" }
+
+[profiles]
+production = ["nginx"]
 ```
 
-List files of an installed package:
+## Commands
+
+### Repository Management
+
 ```bash
-pkgm -r <path> info -l <pkg_name>
+pkgm repo add <name> <url>
+pkgm repo list
+pkgm repo update
+pkgm repo remove <name>
 ```
 
-List files inside an uninstalled package archive:
+### Search
+
 ```bash
-pkgm info -l <pkg_archive>
+pkgm search <query>
 ```
 
-Find package owning a specific file pattern:
+### Install
+
 ```bash
-pkgm -r <path> info -o "<pattern>"
+pkgm install <pkg_name>             # from repository
+pkgm install <pkg_archive>          # from local file
+pkgm install -u <pkg_archive>       # upgrade
+pkgm install -f <pkg_archive>       # force overwrite
 ```
 
-Print archive footprint details:
+### Remove
+
 ```bash
-pkgm info -f <pkg_archive>
+pkgm remove <pkg_name>
 ```
 
-### 3. Unpack Archive (`unpack`)
-Unpack archive without database registration:
+### Info
+
 ```bash
-pkgm unpack <pkg_archive> -d <path>
+pkgm info -i                        # list installed
+pkgm info -l <pkg_name>             # files of installed
+pkgm info -l <pkg_archive>          # files in archive
+pkgm info -o "<pattern>"            # owner by regex
+pkgm info -f <pkg_archive>          # footprint with permissions
 ```
 
-### 4. Package Removal (`remove`)
-Remove an installed package:
+### Unpack
+
 ```bash
-pkgm -r <path> remove <pkg_name>
+pkgm unpack <pkg_archive>
+pkgm unpack <pkg_archive> -d <path> # extract to custom dir
+```
+
+### Apply / Update
+
+```bash
+pkgm apply                          # sync with manifest (removes extras)
+pkgm apply --profile <name>         # use profile
+pkgm update                         # update to manifest versions (no removal)
+```
+
+### Verify
+
+```bash
+pkgm verify all
+pkgm verify <pkg_name>
+```
+
+## License
+
+GPL-3.0-or-later
+
+**Version:** 0.0.2
 ```
