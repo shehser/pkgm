@@ -6,4 +6,4 @@ pkgm.toml
 *.pkg.tar.gz
 *.log
 *.tmp
-Cargo.lock   # опционально, но для бинарных проектов обычно коммитят
+Cargo.lock  
