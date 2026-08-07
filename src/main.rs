@@ -1,114 +1,230 @@
 // Copyright (C) 2026 Yersultan Muapyqov
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: GPL-3.0-or-later
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-pub mod metadata;
-pub mod pkgutil;
-pub mod pkgadd;
-pub mod pkginfo;
-pub mod pkgrm;
+mod metadata;
+mod pkgutil;
 
-use crate::pkgadd::PkgAdd;
-use crate::pkginfo::PkgInfoUtil;
-use crate::pkgrm::PkgRm;
+use metadata::InstalledPkg;
+use pkgutil::PkgUtil;
 
 #[derive(Parser)]
-#[command(name = "pkgm", version, about = "Package manager in Rust", propagate_version = true)]
-pub struct Cli {
-    /// Specify alternative installation root
+#[command(name = "pkgm", version, about = "Fast and reliable package manager")]
+struct Cli {
     #[arg(short, long, global = true)]
-    pub root: Option<PathBuf>,
-
+    root: Option<PathBuf>,
     #[command(subcommand)]
-    pub command: Commands,
+    command: Command,
 }
 
 #[derive(Subcommand)]
-pub enum Commands {
-    /// Install or upgrade a package
+enum Command {
     Install {
-        /// Package archive file (.pkg.tar.gz)
         package: PathBuf,
-
-        /// Upgrade package with the same name
         #[arg(short, long)]
         upgrade: bool,
-
-        /// Force install, overwrite conflicting files
         #[arg(short, long)]
         force: bool,
     },
-    /// Unpack archive content to a directory without modifying database
     Unpack {
-        /// Package archive file (.pkg.tar.gz)
         package: PathBuf,
-
-        /// Target directory (default: current directory)
         #[arg(short, long, default_value = ".")]
         dir: PathBuf,
     },
-    /// Remove an installed package
     Remove {
-        /// Name of the package to remove
         package: String,
     },
-    /// Inspect database, installed packages, or footprint
     Info {
-        /// List installed packages
         #[arg(short, long)]
         installed: bool,
-
-        /// List files in installed package or package archive
         #[arg(short, long)]
         list: Option<String>,
-
-        /// List owner(s) of file(s) matching pattern
         #[arg(short, long)]
         owner: Option<String>,
-
-        /// Print footprint for package file
         #[arg(short, long)]
         footprint: Option<PathBuf>,
     },
+    Apply {
+        #[arg(short, long, default_value = "pkgm.toml")]
+        config: PathBuf,
+        #[arg(short, long)]
+        profile: Option<String>,
+    },
+    Update {
+        #[arg(short, long, default_value = "pkgm.toml")]
+        config: PathBuf,
+        #[arg(short, long)]
+        profile: Option<String>,
+    },
+    Repo {
+        #[command(subcommand)]
+        action: RepoAction,
+    },
+    Search {
+        query: String,
+    },
+    Verify {
+        #[arg(default_value = "all")]
+        package: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum RepoAction {
+    List,
+    Add { name: String, url: String },
+    Remove { name: String },
+    Update,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let root_path = cli.root.unwrap_or_default();
+    let root = cli.root.unwrap_or_default();
 
     match cli.command {
-        Commands::Install { package, upgrade, force } => {
-            let mut adder = PkgAdd::new(root_path);
-            adder.run_install(package, upgrade, force)?;
+        Command::Install { package, upgrade, force } => {
+            let mut util = PkgUtil::new(root);
+
+            let (pkg_path, checksum_opt) = if package.exists() {
+                (package, None)
+            } else {
+                let name = package.to_string_lossy().to_string();
+                let (url, version, checksum_opt) = util.resolve_package(&name)?;
+                println!("Found {} version {} in repository", name, version);
+                let downloaded = pkgutil::download_package(&url, &name)?;
+                (downloaded, checksum_opt)
+            };
+
+            util.db_open()?;
+            let (meta, files) = util.pkg_open(&pkg_path)?;
+            let name = &meta.name;
+
+            if util.db_find_package(name) && !upgrade {
+                anyhow::bail!("{} already installed (use --upgrade)", name);
+            }
+            if !util.db_find_package(name) && upgrade {
+                anyhow::bail!("{} not installed", name);
+            }
+
+            let conflicts = util.db_find_conflicts(name, &files);
+            if !conflicts.is_empty() && !force {
+                eprintln!("Conflicting files:");
+                for f in &conflicts {
+                    eprintln!("  {}", f);
+                }
+                anyhow::bail!("use --force to overwrite");
+            }
+
+            if upgrade {
+                util.db_remove_package(name);
+            }
+
+            util.pkg_install(&pkg_path)?;
+            util.db_add_package(InstalledPkg {
+                name: meta.name.clone(),
+                version: meta.version,
+                description: meta.description,
+                files,
+                checksum: checksum_opt,
+            });
+            util.db_commit()?;
+            util.run_ldconfig()?;
+            println!("Installed {}", meta.name);
         }
-        Commands::Unpack { package, dir } => {
-            let util = pkgutil::PkgUtil::new("pkgm unpack", root_path);
-            util.pkg_unpack(&package, &dir)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
+        Command::Unpack { package, dir } => {
+            let util = PkgUtil::new(root);
+            util.pkg_unpack(&package, &dir)?;
             println!("Unpacked {} into {}", package.display(), dir.display());
         }
-        Commands::Remove { package } => {
-            let mut remover = PkgRm::new(root_path);
-            remover.run_remove(&package)?;
+        Command::Remove { package } => {
+            let mut util = PkgUtil::new(root);
+            util.db_open()?;
+            if !util.db_find_package(&package) {
+                anyhow::bail!("{} not installed", package);
+            }
+            util.db_remove_package(&package);
+            util.db_commit()?;
+            util.run_ldconfig()?;
+            println!("Removed {}", package);
         }
-        Commands::Info { installed, list, owner, footprint } => {
-            let mut info_util = PkgInfoUtil::new(root_path);
-            info_util.run_info(installed, list, owner, footprint)?;
+        Command::Info { installed, list, owner, footprint } => {
+            if let Some(fp) = footprint {
+                let util = PkgUtil::new(root);
+                return util.pkg_footprint(&fp);
+            }
+
+            let mut util = PkgUtil::new(root);
+            util.db_open()?;
+
+            if installed {
+                for (name, pkg) in &util.packages {
+                    println!("{} {}", name, pkg.version);
+                }
+            } else if let Some(target) = list {
+                if util.db_find_package(&target) {
+                    if let Some(pkg) = util.packages.get(&target) {
+                        for f in &pkg.files {
+                            println!("{}", f);
+                        }
+                    }
+                } else if PathBuf::from(&target).exists() {
+                    let (_, files) = util.pkg_open(&target)?;
+                    for f in &files {
+                        println!("{}", f);
+                    }
+                } else {
+                    anyhow::bail!("{} is neither installed nor a valid archive", target);
+                }
+            } else if let Some(pattern) = owner {
+                let re = regex::Regex::new(&pattern)?;
+                let mut results = Vec::new();
+                let mut max_len = 0;
+                for (name, pkg) in &util.packages {
+                    for f in &pkg.files {
+                        if re.is_match(&format!("/{}", f)) {
+                            results.push((name.clone(), f.clone()));
+                            max_len = max_len.max(name.len());
+                        }
+                    }
+                }
+                if results.is_empty() {
+                    println!("No owners match pattern: {}", pattern);
+                } else {
+                    for (pkg, f) in results {
+                        println!("{:width$}  {}", pkg, f, width = max_len);
+                    }
+                }
+            } else {
+                anyhow::bail!("No info flag provided. See --help.");
+            }
+        }
+        Command::Apply { config, profile } => {
+            let mut util = PkgUtil::new(root);
+            util.pkg_apply(&config, profile.as_deref())?;
+        }
+        Command::Update { config, profile } => {
+            let mut util = PkgUtil::new(root);
+            util.pkg_update(&config, profile.as_deref())?;
+        }
+        Command::Repo { action } => {
+            let util = PkgUtil::new(root);
+            match action {
+                RepoAction::List => util.repo_list()?,
+                RepoAction::Add { name, url } => util.repo_add(&name, &url)?,
+                RepoAction::Remove { name } => util.repo_remove(&name)?,
+                RepoAction::Update => util.repo_update()?,
+            }
+        }
+        Command::Search { query } => {
+            let util = PkgUtil::new(root);
+            util.search(&query)?;
+        }
+        Command::Verify { package } => {
+            let util = PkgUtil::new(root);
+            util.verify(&package)?;
         }
     }
 
