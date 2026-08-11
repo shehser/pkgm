@@ -3,23 +3,29 @@
 
 use anyhow::{Context, Ok, Result, bail};
 use flate2::read::GzDecoder;
+use fs2::FileExt;
 use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Read};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::env;
+use std::time::Duration;
 use tar::{Archive, Entry, EntryType};
 use users::{get_group_by_gid, get_user_by_uid};
 use sha256::try_digest;
 use crate::metadata::{parse_package_name, InstalledPkg, PkgMetadata, Manifest, ManifestPkg, RepoIndex};
+use tempfile::NamedTempFile;
+
+use log::{debug, warn};
 
 const DB_JSON: &str = "db/pkgdb.json";
+const DB_LOCK: &str = "db/pkgdb.lock";
 const META_FILE: &str = "metadata.json";
 const LDCONFIG: &str = "/usr/bin/ldconfig";
 const REPOS_FILE: &str = "repos.toml";
 const CACHE_DIR: &str = "cache/pkgm/repos";
+const PACKAGES_CACHE_DIR: &str = "cache/pkgm/packages";
+const HTTP_TIMEOUT_SECS: u64 = 30;
 
 pub type Packages = HashMap<String, InstalledPkg>;
 
@@ -36,49 +42,86 @@ struct FootprintEntry {
 pub struct PkgUtil {
     pub packages: Packages,
     pub root: PathBuf,
+    http: reqwest::blocking::Client,
+    // Held exclusively from db_open until drop – prevents concurrent write races.
+    _db_lock: Option<File>,
+    pub dry_run: bool,
 }
 
 impl PkgUtil {
     pub fn new(root: impl Into<PathBuf>) -> Self {
+        let http = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
+            .connect_timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
+            .build()
+            .unwrap_or_else(|_| reqwest::blocking::Client::new());
         Self {
             packages: HashMap::new(),
             root: root.into(),
+            http,
+            _db_lock: None,
+            dry_run: false,
         }
     }
 
-    // database operations
-    pub fn db_open(&mut self) -> Result<()> {
-        let path = self.root.join(DB_JSON);
-        if !path.exists() {
-            self.packages.clear();
-            return Ok(());
-        }
-        let f = File::open(&path).with_context(|| format!("open {}", path.display()))?;
-        self.packages = serde_json::from_reader(BufReader::new(f))
-            .with_context(|| format!("parse {}", path.display()))?;
-        Ok(())
+    pub fn set_dry_run(&mut self, dry: bool) {
+        self.dry_run = dry;
     }
 
-    pub fn db_commit(&self) -> Result<()> {
+    /// Opens the database with the appropriate lock:
+    /// - shared lock for readonly (dry‑run)
+    /// - exclusive lock for write operations.
+    pub fn db_open(&mut self, readonly: bool) -> Result<()> {
         let path = self.root.join(DB_JSON);
-        let tmp = path.with_extension("tmp");
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).context("create db dir")?;
         }
-        let f = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o644)
-            .open(&tmp)
-            .with_context(|| format!("create {}", tmp.display()))?;
 
-        serde_json::to_writer_pretty(&f, &self.packages)
+        let lock_path = self.root.join(DB_LOCK);
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| format!("open lock file {}", lock_path.display()))?;
+
+        if readonly {
+            lock_file.try_lock_shared()
+                .with_context(|| "DB is locked for writing by another process")?;
+        } else {
+            lock_file.try_lock_exclusive()
+                .with_context(|| "DB is locked by another pkgm process")?;
+        }
+        self._db_lock = Some(lock_file);
+
+        if path.exists() {
+            let f = File::open(&path).with_context(|| format!("open {}", path.display()))?;
+            self.packages = serde_json::from_reader(BufReader::new(f))
+                .with_context(|| format!("parse {}", path.display()))?;
+        } else {
+            self.packages.clear();
+        }
+        Ok(())
+    }
+
+    /// Atomically write the database using a temporary file and rename.
+    pub fn db_commit(&self) -> Result<()> {
+        let path = self.root.join(DB_JSON);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).context("create db dir")?;
+        }
+        let tmp = NamedTempFile::new_in(path.parent().unwrap_or(Path::new(".")))
+            .context("create temporary db file")?;
+        serde_json::to_writer_pretty(tmp.as_file(), &self.packages)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
             .context("serialize db")?;
 
-        f.sync_all().context("sync db")?;
-        fs::rename(&tmp, &path).context("commit db rename")?;
+        tmp.as_file().sync_all().context("sync db")?;
+        tmp.persist(&path)
+            .map_err(|e| {
+                eprintln!("warning : failed to commit database: {}" ,e);
+                e
+            })
+            .context("commit db rename")?;
         Ok(())
     }
 
@@ -90,6 +133,7 @@ impl PkgUtil {
         self.packages.insert(pkg.name.clone(), pkg);
     }
 
+    /// Remove a package and delete files not owned by any other package.
     pub fn db_remove_package(&mut self, name: &str) {
         let Some(pkg) = self.packages.remove(name) else { return };
         let mut files = pkg.files;
@@ -98,11 +142,14 @@ impl PkgUtil {
                 files.remove(f);
             }
         }
+        // Traverse in reverse to delete empty parent directories.
         for path in files.iter().rev() {
             self.remove_path(path);
         }
     }
 
+    /// Find files that conflict with already installed packages or exist on disk.
+    /// When upgrading, files from the current package are excluded.
     pub fn db_find_conflicts(&self, name: &str, files: &BTreeSet<String>) -> BTreeSet<String> {
         let mut conflicts = BTreeSet::new();
         for (pkg, info) in &self.packages {
@@ -123,7 +170,7 @@ impl PkgUtil {
         conflicts
     }
 
-    // package archive operations
+    /// Open a package archive and return metadata and file list.
     pub fn pkg_open(&self, path: impl AsRef<Path>) -> Result<(PkgMetadata, BTreeSet<String>)> {
         let path = path.as_ref();
         let f = File::open(path).with_context(|| format!("open {}", path.display()))?;
@@ -136,7 +183,10 @@ impl PkgUtil {
             let p = entry.path().context("invalid path")?;
             let s = p.to_string_lossy();
             if s == META_FILE {
-                meta = serde_json::from_reader(entry).ok();
+                meta = Some(
+                    serde_json::from_reader(entry)
+                        .with_context(|| format!("parse {} inside archive", META_FILE))?,
+                );
             } else {
                 files.insert(s.into_owned());
             }
@@ -157,6 +207,7 @@ impl PkgUtil {
         Ok((meta, files))
     }
 
+    /// Install a package archive into the managed root.
     pub fn pkg_install(&self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
         let f = File::open(path).with_context(|| format!("open {}", path.display()))?;
@@ -170,6 +221,7 @@ impl PkgUtil {
         Ok(())
     }
 
+    /// Unpack a package archive into an arbitrary directory (for inspection).
     pub fn pkg_unpack(&self, path: impl AsRef<Path>, target: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
         let target = target.as_ref();
@@ -186,12 +238,18 @@ impl PkgUtil {
         Ok(())
     }
 
+    // Extract a single archive entry. Rejects paths that escape the destination.
     fn unpack_entry<R: Read>(&self, entry: &mut Entry<R>, dest_dir: &Path) -> Result<()> {
         let p = entry.path().context("invalid entry path")?.to_path_buf();
         if p.to_string_lossy() == META_FILE {
             return Ok(());
         }
-
+        if p.is_absolute() || p.components().any(|c| c == std::path::Component::ParentDir) {
+            anyhow::bail!(
+                "refusing to unpack archive with unsafe path: {}",
+                p.display()
+            );
+        }
         let dest = dest_dir.join(&p);
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent).context("create parent directory")?;
@@ -203,10 +261,10 @@ impl PkgUtil {
 
         entry.unpack(&dest).with_context(|| format!("failed to unpack {}", dest.display()))?;
         self.extract_nested(&p, &dest)?;
-
         Ok(())
     }
 
+    // If the entry is a nested tarball, extract it and remove the intermediate file.
     fn extract_nested(&self, entry_path: &Path, dest_path: &Path) -> Result<()> {
         let s = entry_path.to_string_lossy();
         if !(s.ends_with(".tar.gz") || s.ends_with(".tgz")) {
@@ -215,13 +273,16 @@ impl PkgUtil {
 
         let f = File::open(dest_path).with_context(|| format!("open nested tar {}", dest_path.display()))?;
         let mut nested = Archive::new(GzDecoder::new(f));
-        nested.unpack(&self.root).with_context(|| format!("unpack nested tar {}", dest_path.display()))?;
+        let root = fs::canonicalize(&self.root).context("resolve root")?;
+        for entry in nested.entries().context("read nested archive")? {
+            let mut entry = entry.context("corrupt nested entry")?;
+            self.unpack_entry(&mut entry, &root)?;
+        }
         fs::remove_file(dest_path).with_context(|| format!("remove nested archive {}", dest_path.display()))?;
-
         Ok(())
     }
 
-    // footprint
+    /// Print a human‑readable manifest of an archive's contents.
     pub fn pkg_footprint(&self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
         let f = File::open(path).with_context(|| format!("open {}", path.display()))?;
@@ -290,7 +351,7 @@ impl PkgUtil {
         println!();
     }
 
-    // system utilities
+    /// Run ldconfig inside the managed root (no‑op if ldconfig is missing).
     pub fn run_ldconfig(&self) -> Result<()> {
         if !Path::new(LDCONFIG).exists() {
             return Ok(());
@@ -306,6 +367,7 @@ impl PkgUtil {
         Ok(())
     }
 
+    // Try to remove a path; silently ignore non‑empty directories.
     fn remove_path(&self, file: &str) {
         let trimmed = file.trim_start_matches(['.', '/']);
         if trimmed.is_empty() {
@@ -328,7 +390,7 @@ impl PkgUtil {
         }
     }
 
-    // manifest sync
+    // Read the manifest and extract packages either from the whole list or a specific profile.
     fn read_manifest_packages(&self, config_path: &Path, profile: Option<&str>) -> Result<HashMap<String, ManifestPkg>> {
         let content = fs::read_to_string(config_path)
             .with_context(|| format!("read config {}", config_path.display()))?;
@@ -351,8 +413,32 @@ impl PkgUtil {
         }
     }
 
+    // Core synchronization: remove obsolete, add/upgrade packages.
     fn sync_packages(&mut self, packages: HashMap<String, ManifestPkg>, remove_obsolete: bool) -> Result<()> {
-        self.db_open()?;
+        self.db_open(self.dry_run)?;
+
+        if self.dry_run {
+            println!("[DRY RUN] Would synchronize packages:");
+            if remove_obsolete {
+                for name in self.packages.keys() {
+                    if !packages.contains_key(name) {
+                        println!("  - remove {}", name);
+                    }
+                }
+            }
+            for (name, spec) in &packages {
+                if let Some(installed) = self.packages.get(name) {
+                    if installed.version != spec.version {
+                        println!("  - upgrade {} {} -> {}", name, installed.version, spec.version);
+                    } else {
+                        println!("  - {} already up-to-date", name);
+                    }
+                } else {
+                    println!("  - install {} {}", name, spec.version);
+                }
+            }
+            return Ok(());
+        }
 
         if remove_obsolete {
             let installed_names: Vec<String> = self.packages.keys().cloned().collect();
@@ -377,10 +463,19 @@ impl PkgUtil {
 
             println!("Installing: {} {}", name, spec.version);
             let pkg_path = if is_remote_url(&spec.url) {
-                download_package(&spec.url, name)?
+                self.download_package(&spec.url, name, &spec.version, spec.checksum.as_deref())?
             } else {
                 PathBuf::from(&spec.url)
             };
+
+            if let Some(expected) = &spec.checksum {
+                if let Err(e) = self.verify_checksum(&pkg_path, expected) {
+                    if is_remote_url(&spec.url) {
+                        let _ = fs::remove_file(&pkg_path);
+                    }
+                    return Err(e);
+                }
+            }
 
             let (meta, files) = self.pkg_open(&pkg_path)?;
             let conflicts = self.db_find_conflicts(name, &files);
@@ -401,7 +496,7 @@ impl PkgUtil {
                 version: meta.version,
                 description: meta.description,
                 files,
-                checksum: None,
+                checksum: spec.checksum.clone(),
             });
 
             if is_remote_url(&spec.url) {
@@ -418,24 +513,55 @@ impl PkgUtil {
     pub fn pkg_apply(&mut self, config_path: &Path, profile: Option<&str>) -> Result<()> {
         let packages = self.read_manifest_packages(config_path, profile)?;
         self.sync_packages(packages, true)?;
-        println!("System synchronized successfully!");
+        if !self.dry_run {
+            println!("System synchronized successfully!");
+        }
         Ok(())
     }
 
     pub fn pkg_update(&mut self, config_path: &Path, profile: Option<&str>) -> Result<()> {
         let packages = self.read_manifest_packages(config_path, profile)?;
         self.sync_packages(packages, false)?;
-        println!("All packages up to date!");
+        if !self.dry_run {
+            println!("All packages up to date!");
+        }
         Ok(())
     }
 
-    // repository management
+    // ---- Repository management ----
+
     fn repos_path(&self) -> PathBuf {
         self.root.join(REPOS_FILE)
     }
 
     fn cache_dir(&self) -> PathBuf {
         self.root.join(CACHE_DIR)
+    }
+
+    fn packages_cache_dir(&self) -> PathBuf {
+        self.root.join(PACKAGES_CACHE_DIR)
+    }
+
+    pub fn clean_package_cache(&self) -> Result<()> {
+        let dir = self.packages_cache_dir();
+        if dir.exists() {
+            fs::remove_dir_all(&dir).context("remove packages cache")?;
+            println!("Packages cache cleared.");
+        } else {
+            println!("Package cache already empty.");
+        }
+        Ok(())
+    }
+
+    pub fn clean_repo_cache(&self) -> Result<()> {
+        let dir = self.cache_dir();
+        if dir.exists() {
+            fs::remove_dir_all(&dir).context("remove repos cache")?;
+            println!("Repository cache cleared.");
+        } else {
+            println!("Repo cache already empty.");
+        }
+        Ok(())
     }
 
     fn read_repos(&self) -> Result<HashMap<String, String>> {
@@ -505,11 +631,10 @@ impl PkgUtil {
         let cache_dir = self.cache_dir();
         fs::create_dir_all(&cache_dir).context("create cache dir")?;
 
-        let client = reqwest::blocking::Client::new();
         for (name, base_url) in &repos {
             println!("Updating '{}' from {}", name, base_url);
             let index_url = format!("{}/index.json", base_url.trim_end_matches('/'));
-            let resp = client.get(&index_url).send()
+            let resp = self.http.get(&index_url).send()
                 .with_context(|| format!("failed to fetch {}", index_url))?;
             if !resp.status().is_success() {
                 bail!("HTTP {} for {}", resp.status(), index_url);
@@ -525,7 +650,6 @@ impl PkgUtil {
         Ok(())
     }
 
-    // search
     pub fn search(&self, query: &str) -> Result<()> {
         let cache_dir = self.cache_dir();
         if !cache_dir.exists() {
@@ -572,7 +696,7 @@ impl PkgUtil {
         Ok(())
     }
 
-    // package resolution
+    /// Look up a package in repository caches and return its URL, version, and optional checksum.
     pub fn resolve_package(&self, name: &str) -> Result<(String, String, Option<String>)> {
         let cache_dir = self.cache_dir();
         if !cache_dir.exists() {
@@ -593,33 +717,35 @@ impl PkgUtil {
         }
         bail!("package '{}' not found in any repository", name);
     }
-    
+
+    /// Verify installed packages: checks files existence and checksum (if available).
     pub fn verify(&self, package_name: &str) -> Result<()> {
         let packages = if package_name == "all" {
             self.packages.clone()
-        }else{
-            let pkg = self.packages.get(package_name).ok_or_else(|| anyhow::anyhow!("package '{}' not installed", package_name))?;
+        } else {
+            let pkg = self.packages.get(package_name)
+                .ok_or_else(|| anyhow::anyhow!("package '{}' not installed", package_name))?;
             let mut map = HashMap::new();
-            map.insert(package_name.to_string(), pkg.clone()); 
+            map.insert(package_name.to_string(), pkg.clone());
             map
         };
 
-        for (name,pkg) in &packages{
+        for (name, pkg) in &packages {
             println!("verifying package: {}", name);
             let mut all_ok = true;
-            for file in &pkg.files{
-                let  path = Path::new(&self.root).join(file);
-                if !path.exists(){
+            for file in &pkg.files {
+                let path = Path::new(&self.root).join(file);
+                if !path.exists() {
                     eprintln!("  missing file: {}", path.display());
                     all_ok = false;
                     continue;
                 }
 
-                if let Some(expected) = &pkg.checksum{
+                if let Some(expected) = &pkg.checksum {
                     let actual = Self::compute_file_sha256(&path)?;
-                    if actual == *expected{
+                    if actual == *expected {
                         println!("  OK: {}", file);
-                    }else {
+                    } else {
                         println!("  FAILED: {} (checksum mismatch)", file);
                         all_ok = false;
                     }
@@ -627,12 +753,12 @@ impl PkgUtil {
                     println!("  OK: {} (no checksum to verify)", file);
                 }
             }
-            if all_ok{
+            if all_ok {
                 println!("{}: OK", name);
             } else {
                 println!("{}: FAILED", name);
             }
-        } 
+        }
         Ok(())
     }
 
@@ -640,19 +766,75 @@ impl PkgUtil {
         try_digest(path)
             .with_context(|| format!("failed to compute sha256 for {}", path.display()))
     }
-}
 
-// helpers
-pub fn download_package(url: &str, name: &str) -> Result<PathBuf> {
-    let client = reqwest::blocking::Client::new();
-    let resp = client.get(url).send().context("download failed")?;
-    if !resp.status().is_success() {
-        bail!("HTTP {} for {}", resp.status(), url);
+    pub fn verify_checksum(&self, path: &Path, expected: &str) -> Result<()> {
+        let actual = Self::compute_file_sha256(path)?;
+        if actual != expected {
+            bail!(
+                "checksum mismatch for {}: expected {}, got {}",
+                path.display(),
+                expected,
+                actual
+            );
+        }
+        Ok(())
     }
-    let bytes = resp.bytes().context("read response")?;
-    let dest = env::temp_dir().join(format!("{}.pkg.tar.gz", name));
-    fs::write(&dest, bytes).context("save package")?;
-    Ok(dest)
+
+    /// Download a package, with caching.
+    /// If the file already exists in the cache and its checksum matches (if provided),
+    /// return the cached path without re‑downloading.
+    pub fn download_package(
+        &self,
+        url: &str,
+        name: &str,
+        version: &str,
+        expected_checksum: Option<&str>,
+    ) -> Result<PathBuf> {
+        let cache_dir = self.packages_cache_dir();
+        fs::create_dir_all(&cache_dir).context("create package cache dir")?;
+
+        let cached_path = cache_dir.join(format!("{}-{}.pkg.tar.gz", name, version));
+
+        // Check cache first.
+        if cached_path.exists() {
+            if let Some(checksum) = expected_checksum {
+                if self.verify_checksum(&cached_path, checksum).is_ok() {
+                    debug!("Using cached package: {}", cached_path.display());
+                    return Ok(cached_path);
+                } else {
+                    warn!("Cached package corrupted, redownloading: {}", cached_path.display());
+                    let _ = fs::remove_file(&cached_path);
+                }
+            } else {
+                // No checksum to verify – trust the cache (but it's a risk).
+                return Ok(cached_path);
+            }
+        }
+
+        // Download to a temporary file first to avoid corruption.
+        let temp_file = tempfile::NamedTempFile::new_in(&cache_dir)
+            .context("create temp file for download")?;
+        let temp_path = temp_file.path().to_path_buf();
+
+        let resp = self.http.get(url).send().context("download failed")?;
+        if !resp.status().is_success() {
+            bail!("HTTP {} for {}", resp.status(), url);
+        }
+        let bytes = resp.bytes().context("read response")?;
+        fs::write(&temp_path, &bytes).context("write temp file")?;
+
+        // Verify after download before moving.
+        if let Some(checksum) = expected_checksum {
+            self.verify_checksum(&temp_path, checksum)?;
+        }
+
+        // Atomically move into cache.
+        fs::rename(&temp_path, &cached_path)
+            .with_context(|| format!("move to cache: {}", cached_path.display()))?;
+
+        debug!("Downloaded and cached: {}", cached_path.display());
+        Ok(cached_path)
+    }
 }
 
 fn is_remote_url(url: &str) -> bool {

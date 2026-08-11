@@ -18,7 +18,7 @@ pub struct InstalledPkg {
     pub version: String,
     pub description: Option<String>,
     pub files: BTreeSet<String>,
-    pub checksum: Option<String>, 
+    pub checksum: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -32,6 +32,8 @@ pub struct Manifest {
 pub struct ManifestPkg {
     pub url: String,
     pub version: String,
+    #[serde(default)]
+    pub checksum: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
