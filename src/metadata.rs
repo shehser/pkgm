@@ -1,5 +1,5 @@
 // Copyright (C) 2026 Yersultan Muapyqov
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: GPL-2.0
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};

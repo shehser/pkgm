@@ -6,4 +6,3 @@ pkgm.toml
 *.pkg.tar.gz
 *.log
 *.tmp
-Cargo.lock  
