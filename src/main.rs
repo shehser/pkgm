@@ -29,7 +29,8 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Install {
-        package: PathBuf,
+        #[arg(required = true)]
+        packages: Vec<PathBuf>,
         #[arg(short, long)]
         upgrade: bool,
         #[arg(short, long)]
@@ -97,111 +98,128 @@ fn main() -> Result<()> {
     let root = cli.root.unwrap_or_default();
 
     match cli.command {
-        Command::Install { package, upgrade, force } => {
+        Command::Install { packages, upgrade, force } => {
             let mut util = PkgUtil::new(root);
             util.set_dry_run(cli.dry_run);
             util.set_no_auto_update(cli.no_auto_update);
             let dry = util.dry_run;
 
+            // Open DB once for all packages.
             util.db_open(dry)?;
 
-            let (pkg_path, checksum_opt, downloaded, version) = if package.exists() {
-                let (_name, ver) = metadata::parse_package_name(
-                    package.file_name().unwrap_or_default().to_str().unwrap_or("")
-                );
-                (package.clone(), None, false, ver)
-            } else {
-                let name = package.to_string_lossy().to_string();
-                let (url, ver, checksum_opt) = util.resolve_package(&name)?;
-                if dry {
-                    println!("[DRY RUN] Found {} version {} in repository", name, ver);
-                    println!("[DRY RUN] Would download from {}", url);
-                    (PathBuf::from(&format!("/tmp/dry-{}", name)), checksum_opt, true, ver)
+            let mut any_installed = false;
+
+            for package in packages {
+                // Resolve local file vs. repository download.
+                let (pkg_path, checksum_opt, downloaded, version) = if package.exists() {
+                    let (_name, ver) = metadata::parse_package_name(
+                        package.file_name().unwrap_or_default().to_str().unwrap_or("")
+                    );
+                    (package.clone(), None, false, ver)
                 } else {
-                    println!("Found {} version {} in repository", name, ver);
-                    let downloaded_path = util.download_package(&url, &name, &ver, checksum_opt.as_deref())?;
-                    (downloaded_path, checksum_opt, true, ver)
-                }
-            };
-
-            if let Some(expected) = &checksum_opt {
-                if dry {
-                    println!("[DRY RUN] Would verify checksum: {}", expected);
-                } else if let Err(e) = util.verify_checksum(&pkg_path, expected) {
-                    if downloaded { let _ = fs::remove_file(&pkg_path); }
-                    return Err(e);
-                }
-            }
-
-            let (meta, files) = if dry && downloaded {
-                let name = package.to_string_lossy().to_string();
-                let dummy_meta = metadata::PkgMetadata {
-                    name: name.clone(),
-                    version: version.clone(),
-                    description: Some("(dry-run)".into()),
+                    let name = package.to_string_lossy().to_string();
+                    let (url, ver, checksum_opt) = util.resolve_package(&name)?;
+                    if dry {
+                        println!("[DRY RUN] Found {} version {} in repository", name, ver);
+                        println!("[DRY RUN] Would download from {}", url);
+                        (PathBuf::from(&format!("/tmp/dry-{}", name)), checksum_opt, true, ver)
+                    } else {
+                        println!("Found {} version {} in repository", name, ver);
+                        let downloaded_path = util.download_package(&url, &name, &ver, checksum_opt.as_deref())?;
+                        (downloaded_path, checksum_opt, true, ver)
+                    }
                 };
-                (dummy_meta, BTreeSet::new())
-            } else {
-                util.pkg_open(&pkg_path)?
-            };
 
-            let name = &meta.name;
-            let already = util.db_find_package(name);
-
-            if already && !upgrade {
-                anyhow::bail!("{} already installed (use --upgrade)", name);
-            }
-            if !already && upgrade {
-                anyhow::bail!("{} not installed", name);
-            }
-
-            let conflicts = util.db_find_conflicts(name, &files);
-            if !conflicts.is_empty() && !force {
-                eprintln!("Conflicting files:");
-                for f in &conflicts { eprintln!("  {}", f); }
-                anyhow::bail!("use --force to overwrite");
-            }
-
-            if dry {
-                println!("[DRY RUN] Would {} {} {}",
-                    if upgrade { "upgrade" } else { "install" },
-                    name,
-                    meta.version
-                );
-                if already && upgrade {
-                    if let Some(old) = util.packages.get(name) {
-                        println!("  Old version: {}", old.version);
+                // Verify checksum early.
+                if let Some(expected) = &checksum_opt {
+                    if dry {
+                        println!("[DRY RUN] Would verify checksum: {}", expected);
+                    } else if let Err(e) = util.verify_checksum(&pkg_path, expected) {
+                        if downloaded { let _ = fs::remove_file(&pkg_path); }
+                        return Err(e);
                     }
                 }
-                println!("  Files to be unpacked:");
-                for f in &files {
-                    println!("    {}", f);
-                }
-                if !conflicts.is_empty() {
-                    println!("  Conflicts detected (would be overwritten because --force)");
+
+                // Open archive (or dummy for dry-run).
+                let (meta, files) = if dry && downloaded {
+                    let name = package.to_string_lossy().to_string();
+                    let dummy_meta = metadata::PkgMetadata {
+                        name: name.clone(),
+                        version: version.clone(),
+                        description: Some("(dry-run)".into()),
+                    };
+                    (dummy_meta, BTreeSet::new())
                 } else {
-                    println!("  No conflicts.");
+                    util.pkg_open(&pkg_path)?
+                };
+
+                let name = &meta.name;
+                let already = util.db_find_package(name);
+
+                // Check if already installed.
+                if already && !upgrade {
+                    anyhow::bail!("{} already installed (use --upgrade)", name);
                 }
+                if !already && upgrade {
+                    anyhow::bail!("{} not installed", name);
+                }
+
+                // Check conflicts.
+                let conflicts = util.db_find_conflicts(name, &files);
+                if !conflicts.is_empty() && !force {
+                    eprintln!("Conflicting files for {}:", name);
+                    for f in &conflicts { eprintln!("  {}", f); }
+                    anyhow::bail!("use --force to overwrite");
+                }
+
+                // Dry-run: print plan and continue.
+                if dry {
+                    println!("[DRY RUN] Would {} {} {}",
+                        if upgrade { "upgrade" } else { "install" },
+                        name,
+                        meta.version
+                    );
+                    if already && upgrade {
+                        if let Some(old) = util.packages.get(name) {
+                            println!("  Old version: {}", old.version);
+                        }
+                    }
+                    println!("  Files to be unpacked:");
+                    for f in &files {
+                        println!("    {}", f);
+                    }
+                    if !conflicts.is_empty() {
+                        println!("  Conflicts detected (would be overwritten because --force)");
+                    } else {
+                        println!("  No conflicts.");
+                    }
+                    if downloaded { let _ = fs::remove_file(&pkg_path); }
+                    continue; // Skip actual installation for dry-run.
+                }
+
+                // Real installation for this package.
+                if upgrade {
+                    util.db_remove_package(name);
+                }
+                util.pkg_install(&pkg_path)?;
+                util.db_add_package(InstalledPkg {
+                    name: meta.name.clone(),
+                    version: meta.version,
+                    description: meta.description,
+                    files,
+                    checksum: checksum_opt.clone(),
+                });
+
                 if downloaded { let _ = fs::remove_file(&pkg_path); }
-                return Ok(());
+                println!("Installed {}", meta.name);
+                any_installed = true;
             }
 
-            if upgrade {
-                util.db_remove_package(name);
+            // After all packages are processed, commit once and run ldconfig.
+            if !dry && any_installed {
+                util.db_commit()?;
+                util.run_ldconfig()?;
             }
-            util.pkg_install(&pkg_path)?;
-            util.db_add_package(InstalledPkg {
-                name: meta.name.clone(),
-                version: meta.version,
-                description: meta.description,
-                files,
-                checksum: checksum_opt.clone(),
-            });
-            util.db_commit()?;
-            util.run_ldconfig()?;
-            println!("Installed {}", meta.name);
-
-            if downloaded { let _ = fs::remove_file(&pkg_path); }
             Ok(())
         }
 
