@@ -9,7 +9,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tar::{Archive, Entry, EntryType};
 use users::{get_group_by_gid, get_user_by_uid};
 use sha256::try_digest;
@@ -26,6 +26,7 @@ const REPOS_FILE: &str = "repos.toml";
 const CACHE_DIR: &str = "cache/pkgm/repos";
 const PACKAGES_CACHE_DIR: &str = "cache/pkgm/packages";
 const HTTP_TIMEOUT_SECS: u64 = 30;
+const CACHE_TTL_SECS: u64 = 86400; // 24 hours
 
 pub type Packages = HashMap<String, InstalledPkg>;
 
@@ -43,9 +44,9 @@ pub struct PkgUtil {
     pub packages: Packages,
     pub root: PathBuf,
     http: reqwest::blocking::Client,
-    // Held exclusively from db_open until drop – prevents concurrent write races.
     _db_lock: Option<File>,
     pub dry_run: bool,
+    pub no_auto_update: bool,
 }
 
 impl PkgUtil {
@@ -61,6 +62,7 @@ impl PkgUtil {
             http,
             _db_lock: None,
             dry_run: false,
+            no_auto_update: false,
         }
     }
 
@@ -68,9 +70,10 @@ impl PkgUtil {
         self.dry_run = dry;
     }
 
-    /// Opens the database with the appropriate lock:
-    /// - shared lock for readonly (dry‑run)
-    /// - exclusive lock for write operations.
+    pub fn set_no_auto_update(&mut self, val: bool) {
+        self.no_auto_update = val;
+    }
+
     pub fn db_open(&mut self, readonly: bool) -> Result<()> {
         let path = self.root.join(DB_JSON);
         if let Some(parent) = path.parent() {
@@ -103,7 +106,6 @@ impl PkgUtil {
         Ok(())
     }
 
-    /// Atomically write the database using a temporary file and rename.
     pub fn db_commit(&self) -> Result<()> {
         let path = self.root.join(DB_JSON);
         if let Some(parent) = path.parent() {
@@ -133,7 +135,6 @@ impl PkgUtil {
         self.packages.insert(pkg.name.clone(), pkg);
     }
 
-    /// Remove a package and delete files not owned by any other package.
     pub fn db_remove_package(&mut self, name: &str) {
         let Some(pkg) = self.packages.remove(name) else { return };
         let mut files = pkg.files;
@@ -142,14 +143,11 @@ impl PkgUtil {
                 files.remove(f);
             }
         }
-        // Traverse in reverse to delete empty parent directories.
         for path in files.iter().rev() {
             self.remove_path(path);
         }
     }
 
-    /// Find files that conflict with already installed packages or exist on disk.
-    /// When upgrading, files from the current package are excluded.
     pub fn db_find_conflicts(&self, name: &str, files: &BTreeSet<String>) -> BTreeSet<String> {
         let mut conflicts = BTreeSet::new();
         for (pkg, info) in &self.packages {
@@ -170,7 +168,6 @@ impl PkgUtil {
         conflicts
     }
 
-    /// Open a package archive and return metadata and file list.
     pub fn pkg_open(&self, path: impl AsRef<Path>) -> Result<(PkgMetadata, BTreeSet<String>)> {
         let path = path.as_ref();
         let f = File::open(path).with_context(|| format!("open {}", path.display()))?;
@@ -207,7 +204,6 @@ impl PkgUtil {
         Ok((meta, files))
     }
 
-    /// Install a package archive into the managed root.
     pub fn pkg_install(&self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
         let f = File::open(path).with_context(|| format!("open {}", path.display()))?;
@@ -221,7 +217,6 @@ impl PkgUtil {
         Ok(())
     }
 
-    /// Unpack a package archive into an arbitrary directory (for inspection).
     pub fn pkg_unpack(&self, path: impl AsRef<Path>, target: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
         let target = target.as_ref();
@@ -238,7 +233,6 @@ impl PkgUtil {
         Ok(())
     }
 
-    // Extract a single archive entry. Rejects paths that escape the destination.
     fn unpack_entry<R: Read>(&self, entry: &mut Entry<R>, dest_dir: &Path) -> Result<()> {
         let p = entry.path().context("invalid entry path")?.to_path_buf();
         if p.to_string_lossy() == META_FILE {
@@ -264,7 +258,6 @@ impl PkgUtil {
         Ok(())
     }
 
-    // If the entry is a nested tarball, extract it and remove the intermediate file.
     fn extract_nested(&self, entry_path: &Path, dest_path: &Path) -> Result<()> {
         let s = entry_path.to_string_lossy();
         if !(s.ends_with(".tar.gz") || s.ends_with(".tgz")) {
@@ -282,7 +275,6 @@ impl PkgUtil {
         Ok(())
     }
 
-    /// Print a human‑readable manifest of an archive's contents.
     pub fn pkg_footprint(&self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
         let f = File::open(path).with_context(|| format!("open {}", path.display()))?;
@@ -351,7 +343,6 @@ impl PkgUtil {
         println!();
     }
 
-    /// Run ldconfig inside the managed root (no‑op if ldconfig is missing).
     pub fn run_ldconfig(&self) -> Result<()> {
         if !Path::new(LDCONFIG).exists() {
             return Ok(());
@@ -367,7 +358,6 @@ impl PkgUtil {
         Ok(())
     }
 
-    // Try to remove a path; silently ignore non‑empty directories.
     fn remove_path(&self, file: &str) {
         let trimmed = file.trim_start_matches(['.', '/']);
         if trimmed.is_empty() {
@@ -390,7 +380,6 @@ impl PkgUtil {
         }
     }
 
-    // Read the manifest and extract packages either from the whole list or a specific profile.
     fn read_manifest_packages(&self, config_path: &Path, profile: Option<&str>) -> Result<HashMap<String, ManifestPkg>> {
         let content = fs::read_to_string(config_path)
             .with_context(|| format!("read config {}", config_path.display()))?;
@@ -413,7 +402,6 @@ impl PkgUtil {
         }
     }
 
-    // Core synchronization: remove obsolete, add/upgrade packages.
     fn sync_packages(&mut self, packages: HashMap<String, ManifestPkg>, remove_obsolete: bool) -> Result<()> {
         self.db_open(self.dry_run)?;
 
@@ -542,6 +530,40 @@ impl PkgUtil {
         self.root.join(PACKAGES_CACHE_DIR)
     }
 
+    // Path to the timestamp file that records the last successful repo update.
+    fn cache_timestamp_path(&self) -> PathBuf {
+        self.cache_dir().join(".last_update")
+    }
+
+    // Returns true if the repository cache is older than CACHE_TTL_SECS or missing.
+    fn is_repo_cache_stale(&self) -> bool {
+        let path = self.cache_timestamp_path();
+        if !path.exists() {
+            return true;
+        }
+        let last = fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        now.saturating_sub(last) > CACHE_TTL_SECS
+    }
+
+    // Update the repository cache automatically if it is stale and auto-update is not disabled.
+    pub fn ensure_repo_cache_fresh(&self) -> Result<()> {
+        if self.no_auto_update {
+            return Ok(());
+        }
+        if self.is_repo_cache_stale() {
+            println!("Repository cache is stale. Updating automatically...");
+            self.repo_update()?;
+        }
+        Ok(())
+    }
+
     pub fn clean_package_cache(&self) -> Result<()> {
         let dir = self.packages_cache_dir();
         if dir.exists() {
@@ -647,10 +669,20 @@ impl PkgUtil {
                 .with_context(|| format!("write {}", cache_file.display()))?;
             println!("Repository '{}' updated ({} packages)", name, _index.packages.len());
         }
+
+        // Write the timestamp after a successful update of all repositories.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        fs::write(self.cache_timestamp_path(), now.to_string())
+            .context("write cache timestamp")?;
+
         Ok(())
     }
 
     pub fn search(&self, query: &str) -> Result<()> {
+        self.ensure_repo_cache_fresh()?;
         let cache_dir = self.cache_dir();
         if !cache_dir.exists() {
             println!("No cache found. Run 'pkgm repo update' first.");
@@ -698,6 +730,7 @@ impl PkgUtil {
 
     /// Look up a package in repository caches and return its URL, version, and optional checksum.
     pub fn resolve_package(&self, name: &str) -> Result<(String, String, Option<String>)> {
+        self.ensure_repo_cache_fresh()?;
         let cache_dir = self.cache_dir();
         if !cache_dir.exists() {
             bail!("repository cache not found. Run 'pkgm repo update'.");
@@ -718,7 +751,6 @@ impl PkgUtil {
         bail!("package '{}' not found in any repository", name);
     }
 
-    /// Verify installed packages: checks files existence and checksum (if available).
     pub fn verify(&self, package_name: &str) -> Result<()> {
         let packages = if package_name == "all" {
             self.packages.clone()
@@ -780,9 +812,6 @@ impl PkgUtil {
         Ok(())
     }
 
-    /// Download a package, with caching.
-    /// If the file already exists in the cache and its checksum matches (if provided),
-    /// return the cached path without re‑downloading.
     pub fn download_package(
         &self,
         url: &str,
@@ -795,7 +824,6 @@ impl PkgUtil {
 
         let cached_path = cache_dir.join(format!("{}-{}.pkg.tar.gz", name, version));
 
-        // Check cache first.
         if cached_path.exists() {
             if let Some(checksum) = expected_checksum {
                 if self.verify_checksum(&cached_path, checksum).is_ok() {
@@ -806,12 +834,10 @@ impl PkgUtil {
                     let _ = fs::remove_file(&cached_path);
                 }
             } else {
-                // No checksum to verify – trust the cache (but it's a risk).
                 return Ok(cached_path);
             }
         }
 
-        // Download to a temporary file first to avoid corruption.
         let temp_file = tempfile::NamedTempFile::new_in(&cache_dir)
             .context("create temp file for download")?;
         let temp_path = temp_file.path().to_path_buf();
@@ -823,12 +849,10 @@ impl PkgUtil {
         let bytes = resp.bytes().context("read response")?;
         fs::write(&temp_path, &bytes).context("write temp file")?;
 
-        // Verify after download before moving.
         if let Some(checksum) = expected_checksum {
             self.verify_checksum(&temp_path, checksum)?;
         }
 
-        // Atomically move into cache.
         fs::rename(&temp_path, &cached_path)
             .with_context(|| format!("move to cache: {}", cached_path.display()))?;
 

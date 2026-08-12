@@ -20,6 +20,8 @@ struct Cli {
     root: Option<PathBuf>,
     #[arg(short = 'n', long, global = true, help = "Show what would be done without making changes")]
     dry_run: bool,
+    #[arg(long, global = true, help = "Disable automatic repository update")]
+    no_auto_update: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -98,9 +100,9 @@ fn main() -> Result<()> {
         Command::Install { package, upgrade, force } => {
             let mut util = PkgUtil::new(root);
             util.set_dry_run(cli.dry_run);
+            util.set_no_auto_update(cli.no_auto_update);
             let dry = util.dry_run;
 
-            // Open DB in readonly mode for dry-run to avoid write locks.
             util.db_open(dry)?;
 
             let (pkg_path, checksum_opt, downloaded, version) = if package.exists() {
@@ -213,6 +215,7 @@ fn main() -> Result<()> {
         Command::Remove { package } => {
             let mut util = PkgUtil::new(root);
             util.set_dry_run(cli.dry_run);
+            util.set_no_auto_update(cli.no_auto_update);
             util.db_open(util.dry_run)?;
 
             if !util.db_find_package(&package) {
@@ -293,6 +296,7 @@ fn main() -> Result<()> {
         Command::Apply { config, profile } => {
             let mut util = PkgUtil::new(root);
             util.set_dry_run(cli.dry_run);
+            util.set_no_auto_update(cli.no_auto_update);
             util.pkg_apply(&config, profile.as_deref())?;
             Ok(())
         }
@@ -300,6 +304,7 @@ fn main() -> Result<()> {
         Command::Update { config, profile } => {
             let mut util = PkgUtil::new(root);
             util.set_dry_run(cli.dry_run);
+            util.set_no_auto_update(cli.no_auto_update);
             util.pkg_update(&config, profile.as_deref())?;
             Ok(())
         }
@@ -316,7 +321,8 @@ fn main() -> Result<()> {
         }
 
         Command::Search { query } => {
-            let util = PkgUtil::new(root);
+            let mut util = PkgUtil::new(root);
+            util.set_no_auto_update(cli.no_auto_update);
             util.search(&query)?;
             Ok(())
         }
