@@ -680,6 +680,25 @@ impl PkgUtil {
 
         Ok(())
     }
+    
+    pub fn check_updates(&self) -> Result<()> {
+        let mut updates = Vec::new();
+        for (name,installed) in &self.packages {
+            let (_, latest_version, _) = self.resolve_package(name)?;
+            if installed.version != latest_version {
+                updates.push((name.clone(), installed.version.clone(), latest_version));
+            }
+        }
+        if updates.is_empty() {
+            println!("All packages are up to date.");
+        } else {
+            println!("Packages with updates available:");
+            for (name, current, latest) in &updates {
+                println!("  {} {} -> {}", name, current, latest);
+            }
+        }
+        Ok(())
+    }
 
     pub fn search(&self, query: &str) -> Result<()> {
         self.ensure_repo_cache_fresh()?;

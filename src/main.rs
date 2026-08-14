@@ -83,6 +83,7 @@ enum Command {
         #[arg(short, long)]
         repos: bool,
     },
+    Checkupdates,
 }
 
 #[derive(Subcommand)]
@@ -364,6 +365,14 @@ fn main() -> Result<()> {
                 util.clean_package_cache()?;
                 util.clean_repo_cache()?;
             }
+            Ok(())
+        }
+
+        Command::CheckUpdates => {
+            let mut util = PkgUtil::new(root);
+            util.set_no_auto_update(cli.no_auto_update);
+            util.db_open(false)?;
+            util.check_updates()?;
             Ok(())
         }
     }
