@@ -26,7 +26,6 @@ const REPOS_FILE: &str = "repos.toml";
 const CACHE_DIR: &str = "cache/pkgm/repos";
 const PACKAGES_CACHE_DIR: &str = "cache/pkgm/packages";
 const HTTP_TIMEOUT_SECS: u64 = 30;
-const CACHE_TTL_SECS: u64 = 86400; // 24 hours
 
 pub type Packages = HashMap<String, InstalledPkg>;
 
@@ -78,6 +77,18 @@ impl PkgUtil {
             _db_lock: None,
             dry_run: false,
             no_auto_update: false,
+        }
+    }
+
+    /// Create a lightweight clone for use in download threads.
+    pub fn clone_for_download(&self) -> Self {
+        Self {
+            packages: HashMap::new(),
+            root: self.root.clone(),
+            http: self.http.clone(),
+            _db_lock: None,
+            dry_run: false,
+            no_auto_update: self.no_auto_update,
         }
     }
 
@@ -373,7 +384,6 @@ impl PkgUtil {
         Ok(())
     }
 
-    // Removes a path, but only if it is safe – uses trimmed path to avoid root bypass.
     fn remove_path(&self, file: &str) {
         let trimmed = file.trim_start_matches(['.', '/']);
         if trimmed.is_empty() {
@@ -418,7 +428,7 @@ impl PkgUtil {
         }
     }
 
-    fn sync_packages(&mut self, packages: HashMap<String, ManifestPkg>, remove_obsolete: bool) -> Result<()> {
+    pub fn sync_packages(&mut self, packages: HashMap<String, ManifestPkg>, remove_obsolete: bool) -> Result<()> {
         self.db_open(self.dry_run)?;
 
         if self.dry_run {
@@ -550,33 +560,6 @@ impl PkgUtil {
         self.cache_dir().join(".last_update")
     }
 
-    fn is_repo_cache_stale(&self) -> bool {
-        let path = self.cache_timestamp_path();
-        if !path.exists() {
-            return true;
-        }
-        let last = fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .unwrap_or(0);
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        now.saturating_sub(last) > CACHE_TTL_SECS
-    }
-
-    pub fn ensure_repo_cache_fresh(&self) -> Result<()> {
-        if self.no_auto_update {
-            return Ok(());
-        }
-        if self.is_repo_cache_stale() {
-            println!("Repository cache is stale. Updating automatically...");
-            self.repo_update()?;
-        }
-        Ok(())
-    }
-
     pub fn clean_package_cache(&self) -> Result<()> {
         let dir = self.packages_cache_dir();
         if dir.exists() {
@@ -680,8 +663,6 @@ impl PkgUtil {
         Ok(())
     }
 
-    // ---- Check updates ----
-
     pub fn check_updates(&self) -> Result<Vec<UpdateInfo>> {
         let mut updates = Vec::new();
         for (name, installed) in &self.packages {
@@ -697,7 +678,7 @@ impl PkgUtil {
         Ok(updates)
     }
 
-    // ---- Search (text output) ----
+    // ---- Search ----
 
     pub fn search(&self, query: &str) -> Result<()> {
         let results = self.search_json(query)?;
@@ -712,10 +693,7 @@ impl PkgUtil {
         Ok(())
     }
 
-    // ---- Search (returns structured data for JSON) ----
-
     pub fn search_json(&self, query: &str) -> Result<Vec<SearchResult>> {
-        self.ensure_repo_cache_fresh()?;
         let cache_dir = self.cache_dir();
         if !cache_dir.exists() {
             println!("No cache found. Run 'pkgm repo update' first.");
@@ -755,7 +733,6 @@ impl PkgUtil {
     // ---- Resolve package ----
 
     pub fn resolve_package(&self, name: &str) -> Result<(String, String, Option<String>)> {
-        self.ensure_repo_cache_fresh()?;
         let cache_dir = self.cache_dir();
         if !cache_dir.exists() {
             bail!("repository cache not found. Run 'pkgm repo update'.");
@@ -830,8 +807,6 @@ impl PkgUtil {
         Ok(())
     }
 
-    // ---- Download with caching ----
-
     pub fn download_package(
         &self,
         url: &str,
@@ -880,9 +855,6 @@ impl PkgUtil {
         Ok(cached_path)
     }
 
-    // ---- Config validation ----
-
-    /// Validates manifest syntax, URL reachability, and checksum correctness.
     pub fn check_config(&self, config_path: &Path) -> Result<()> {
         let content = fs::read_to_string(config_path)
             .with_context(|| format!("read config {}", config_path.display()))?;
@@ -891,7 +863,6 @@ impl PkgUtil {
 
         println!("Checking configuration: {}", config_path.display());
         for (name, spec) in &manifest.packages {
-            // Check URL reachability (HEAD request for remote)
             if is_remote_url(&spec.url) {
                 let resp = self.http.head(&spec.url).send();
                 match resp {
@@ -908,7 +879,6 @@ impl PkgUtil {
                 }
             }
 
-            // Check checksum if provided (only for local files)
             if let Some(checksum) = &spec.checksum {
                 let path = Path::new(&spec.url);
                 if path.exists() {

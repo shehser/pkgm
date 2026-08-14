@@ -3,9 +3,9 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
+use std::thread;
 
 mod metadata;
 mod pkgutil;
@@ -114,52 +114,74 @@ fn main() -> Result<()> {
 
             util.db_open(dry)?;
 
-            let mut any_installed = false;
-
-            for package in packages {
-                let (pkg_path, checksum_opt, downloaded, version) = if package.exists() {
+            // Resolve all packages
+            let mut resolved = Vec::new();
+            for package in &packages {
+                if package.exists() {
                     let (_name, ver) = metadata::parse_package_name(
                         package.file_name().unwrap_or_default().to_str().unwrap_or("")
                     );
-                    (package.clone(), None, false, ver)
+                    resolved.push((package.clone(), None, false, ver, None));
                 } else {
                     let name = package.to_string_lossy().to_string();
                     let (url, ver, checksum_opt) = util.resolve_package(&name)?;
-                    if dry {
+                    resolved.push((package.clone(), Some((url, ver.clone(), checksum_opt)), true, ver, Some(name)));
+                }
+            }
+
+            if dry {
+                for (package, remote_info, _, _version, name_opt) in &resolved {
+                    let name = name_opt.as_deref().unwrap_or(package.file_name().unwrap_or_default().to_str().unwrap_or(""));
+                    if let Some((url, ver, checksum_opt)) = remote_info {
                         println!("[DRY RUN] Found {} version {} in repository", name, ver);
                         println!("[DRY RUN] Would download from {}", url);
-                        (PathBuf::from(&format!("/tmp/dry-{}", name)), checksum_opt, true, ver)
+                        println!("[DRY RUN] Would verify checksum: {:?}", checksum_opt);
                     } else {
-                        println!("Found {} version {} in repository", name, ver);
-                        let downloaded_path = util.download_package(&url, &name, &ver, checksum_opt.as_deref())?;
-                        (downloaded_path, checksum_opt, true, ver)
-                    }
-                };
-
-                if let Some(expected) = &checksum_opt {
-                    if dry {
-                        println!("[DRY RUN] Would verify checksum: {}", expected);
-                    } else if let Err(e) = util.verify_checksum(&pkg_path, expected) {
-                        if downloaded { let _ = fs::remove_file(&pkg_path); }
-                        return Err(e);
+                        println!("[DRY RUN] Local package: {}", package.display());
                     }
                 }
+                println!("[DRY RUN] No changes applied.");
+                return Ok(());
+            }
 
-                let (meta, files) = if dry && downloaded {
-                    let name = package.to_string_lossy().to_string();
-                    let dummy_meta = metadata::PkgMetadata {
-                        name: name.clone(),
-                        version: version.clone(),
-                        description: Some("(dry-run)".into()),
-                    };
-                    (dummy_meta, BTreeSet::new())
+            // Parallel download remote packages
+            let mut handles = Vec::new();
+            for (_idx, (_, remote_info, _, _, name_opt)) in resolved.iter().enumerate() {
+                if let Some((url, ver, checksum_opt)) = remote_info {
+                    let name = name_opt.as_ref().unwrap().clone();
+                    let url = url.clone();
+                    let ver = ver.clone();
+                    let checksum_opt = checksum_opt.clone();
+                    let util_clone = util.clone_for_download();
+                    handles.push(thread::spawn(move || {
+                        util_clone.download_package(&url, &name, &ver, checksum_opt.as_deref())
+                    }));
+                }
+            }
+
+            let mut downloaded_paths = Vec::new();
+            for handle in handles {
+                let result = handle.join().unwrap();
+                downloaded_paths.push(result?);
+            }
+
+            let mut pkg_paths = Vec::new();
+            let mut download_idx = 0;
+            for (package, remote_info, _, _, _) in resolved {
+                if remote_info.is_some() {
+                    pkg_paths.push(downloaded_paths[download_idx].clone());
+                    download_idx += 1;
                 } else {
-                    util.pkg_open(&pkg_path)?
-                };
+                    pkg_paths.push(package.clone());
+                }
+            }
 
-                let name = &meta.name;
-                let already = util.db_find_package(name);
+            let mut any_installed = false;
+            for pkg_path in pkg_paths {
+                let (meta, files) = util.pkg_open(&pkg_path)?;
+                let name = meta.name.clone();
 
+                let already = util.db_find_package(&name);
                 if already && !upgrade {
                     anyhow::bail!("{} already installed (use --upgrade)", name);
                 }
@@ -167,39 +189,15 @@ fn main() -> Result<()> {
                     anyhow::bail!("{} not installed", name);
                 }
 
-                let conflicts = util.db_find_conflicts(name, &files);
+                let conflicts = util.db_find_conflicts(&name, &files);
                 if !conflicts.is_empty() && !force {
                     eprintln!("Conflicting files for {}:", name);
                     for f in &conflicts { eprintln!("  {}", f); }
                     anyhow::bail!("use --force to overwrite");
                 }
 
-                if dry {
-                    println!("[DRY RUN] Would {} {} {}",
-                        if upgrade { "upgrade" } else { "install" },
-                        name,
-                        meta.version
-                    );
-                    if already && upgrade {
-                        if let Some(old) = util.packages.get(name) {
-                            println!("  Old version: {}", old.version);
-                        }
-                    }
-                    println!("  Files to be unpacked:");
-                    for f in &files {
-                        println!("    {}", f);
-                    }
-                    if !conflicts.is_empty() {
-                        println!("  Conflicts detected (would be overwritten because --force)");
-                    } else {
-                        println!("  No conflicts.");
-                    }
-                    if downloaded { let _ = fs::remove_file(&pkg_path); }
-                    continue;
-                }
-
                 if upgrade {
-                    util.db_remove_package(name);
+                    util.db_remove_package(&name);
                 }
                 util.pkg_install(&pkg_path)?;
                 util.db_add_package(InstalledPkg {
@@ -207,15 +205,18 @@ fn main() -> Result<()> {
                     version: meta.version,
                     description: meta.description,
                     files,
-                    checksum: checksum_opt.clone(),
+                    checksum: None,
                 });
 
-                if downloaded { let _ = fs::remove_file(&pkg_path); }
+                if pkg_path.starts_with(std::env::temp_dir()) {
+                    let _ = fs::remove_file(&pkg_path);
+                }
+
                 println!("Installed {}", meta.name);
                 any_installed = true;
             }
 
-            if !dry && any_installed {
+            if any_installed {
                 util.db_commit()?;
                 util.run_ldconfig()?;
             }
