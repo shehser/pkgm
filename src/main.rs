@@ -105,13 +105,11 @@ fn main() -> Result<()> {
             util.set_no_auto_update(cli.no_auto_update);
             let dry = util.dry_run;
 
-            // Open DB once for all packages.
             util.db_open(dry)?;
 
             let mut any_installed = false;
 
             for package in packages {
-                // Resolve local file vs. repository download.
                 let (pkg_path, checksum_opt, downloaded, version) = if package.exists() {
                     let (_name, ver) = metadata::parse_package_name(
                         package.file_name().unwrap_or_default().to_str().unwrap_or("")
@@ -131,7 +129,6 @@ fn main() -> Result<()> {
                     }
                 };
 
-                // Verify checksum early.
                 if let Some(expected) = &checksum_opt {
                     if dry {
                         println!("[DRY RUN] Would verify checksum: {}", expected);
@@ -141,7 +138,6 @@ fn main() -> Result<()> {
                     }
                 }
 
-                // Open archive (or dummy for dry-run).
                 let (meta, files) = if dry && downloaded {
                     let name = package.to_string_lossy().to_string();
                     let dummy_meta = metadata::PkgMetadata {
@@ -157,7 +153,6 @@ fn main() -> Result<()> {
                 let name = &meta.name;
                 let already = util.db_find_package(name);
 
-                // Check if already installed.
                 if already && !upgrade {
                     anyhow::bail!("{} already installed (use --upgrade)", name);
                 }
@@ -165,7 +160,6 @@ fn main() -> Result<()> {
                     anyhow::bail!("{} not installed", name);
                 }
 
-                // Check conflicts.
                 let conflicts = util.db_find_conflicts(name, &files);
                 if !conflicts.is_empty() && !force {
                     eprintln!("Conflicting files for {}:", name);
@@ -173,7 +167,6 @@ fn main() -> Result<()> {
                     anyhow::bail!("use --force to overwrite");
                 }
 
-                // Dry-run: print plan and continue.
                 if dry {
                     println!("[DRY RUN] Would {} {} {}",
                         if upgrade { "upgrade" } else { "install" },
@@ -195,10 +188,9 @@ fn main() -> Result<()> {
                         println!("  No conflicts.");
                     }
                     if downloaded { let _ = fs::remove_file(&pkg_path); }
-                    continue; // Skip actual installation for dry-run.
+                    continue;
                 }
 
-                // Real installation for this package.
                 if upgrade {
                     util.db_remove_package(name);
                 }
@@ -216,7 +208,6 @@ fn main() -> Result<()> {
                 any_installed = true;
             }
 
-            // After all packages are processed, commit once and run ldconfig.
             if !dry && any_installed {
                 util.db_commit()?;
                 util.run_ldconfig()?;
@@ -368,7 +359,7 @@ fn main() -> Result<()> {
             Ok(())
         }
 
-        Command::CheckUpdates => {
+        Command::Checkupdates => {
             let mut util = PkgUtil::new(root);
             util.set_no_auto_update(cli.no_auto_update);
             util.db_open(false)?;

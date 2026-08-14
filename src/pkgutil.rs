@@ -358,12 +358,13 @@ impl PkgUtil {
         Ok(())
     }
 
+    // Removes a path, but only if it is safe – uses trimmed path to avoid root bypass.
     fn remove_path(&self, file: &str) {
         let trimmed = file.trim_start_matches(['.', '/']);
         if trimmed.is_empty() {
             return;
         }
-        let path = self.root.join(file);
+        let path = self.root.join(trimmed);
         if !path.exists() {
             return;
         }
@@ -530,12 +531,10 @@ impl PkgUtil {
         self.root.join(PACKAGES_CACHE_DIR)
     }
 
-    // Path to the timestamp file that records the last successful repo update.
     fn cache_timestamp_path(&self) -> PathBuf {
         self.cache_dir().join(".last_update")
     }
 
-    // Returns true if the repository cache is older than CACHE_TTL_SECS or missing.
     fn is_repo_cache_stale(&self) -> bool {
         let path = self.cache_timestamp_path();
         if !path.exists() {
@@ -552,7 +551,6 @@ impl PkgUtil {
         now.saturating_sub(last) > CACHE_TTL_SECS
     }
 
-    // Update the repository cache automatically if it is stale and auto-update is not disabled.
     pub fn ensure_repo_cache_fresh(&self) -> Result<()> {
         if self.no_auto_update {
             return Ok(());
@@ -670,7 +668,6 @@ impl PkgUtil {
             println!("Repository '{}' updated ({} packages)", name, _index.packages.len());
         }
 
-        // Write the timestamp after a successful update of all repositories.
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -680,10 +677,10 @@ impl PkgUtil {
 
         Ok(())
     }
-    
+
     pub fn check_updates(&self) -> Result<()> {
         let mut updates = Vec::new();
-        for (name,installed) in &self.packages {
+        for (name, installed) in &self.packages {
             let (_, latest_version, _) = self.resolve_package(name)?;
             if installed.version != latest_version {
                 updates.push((name.clone(), installed.version.clone(), latest_version));
@@ -770,6 +767,8 @@ impl PkgUtil {
         bail!("package '{}' not found in any repository", name);
     }
 
+    /// Verify installed packages: checks file existence only.
+    /// (pkg.checksum is the archive hash, not per-file, so we skip hashing.)
     pub fn verify(&self, package_name: &str) -> Result<()> {
         let packages = if package_name == "all" {
             self.packages.clone()
@@ -789,19 +788,8 @@ impl PkgUtil {
                 if !path.exists() {
                     eprintln!("  missing file: {}", path.display());
                     all_ok = false;
-                    continue;
-                }
-
-                if let Some(expected) = &pkg.checksum {
-                    let actual = Self::compute_file_sha256(&path)?;
-                    if actual == *expected {
-                        println!("  OK: {}", file);
-                    } else {
-                        println!("  FAILED: {} (checksum mismatch)", file);
-                        all_ok = false;
-                    }
                 } else {
-                    println!("  OK: {} (no checksum to verify)", file);
+                    println!("  OK: {}", file);
                 }
             }
             if all_ok {
