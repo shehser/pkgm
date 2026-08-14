@@ -1,7 +1,7 @@
 // Copyright (C) 2026 Yersultan Muapyqov
 // SPDX-License-Identifier: GPL-2.0
 
-use anyhow::{Context, Ok, Result, bail};
+use anyhow::{Context, Result, bail};
 use flate2::read::GzDecoder;
 use fs2::FileExt;
 use std::collections::{BTreeSet, HashMap};
@@ -29,6 +29,21 @@ const HTTP_TIMEOUT_SECS: u64 = 30;
 const CACHE_TTL_SECS: u64 = 86400; // 24 hours
 
 pub type Packages = HashMap<String, InstalledPkg>;
+
+#[derive(Debug, serde::Serialize)]
+pub struct UpdateInfo {
+    pub name: String,
+    pub current: String,
+    pub latest: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct SearchResult {
+    pub repo: String,
+    pub name: String,
+    pub version: String,
+    pub description: String,
+}
 
 struct FootprintEntry {
     path: String,
@@ -584,7 +599,7 @@ impl PkgUtil {
         Ok(())
     }
 
-    fn read_repos(&self) -> Result<HashMap<String, String>> {
+    pub fn read_repos(&self) -> Result<HashMap<String, String>> {
         let path = self.repos_path();
         if !path.exists() {
             return Ok(HashMap::new());
@@ -630,19 +645,6 @@ impl PkgUtil {
         Ok(())
     }
 
-    pub fn repo_list(&self) -> Result<()> {
-        let repos = self.read_repos()?;
-        if repos.is_empty() {
-            println!("No repositories configured.");
-        } else {
-            println!("Repositories:");
-            for (name, url) in &repos {
-                println!("  {}: {}", name, url);
-            }
-        }
-        Ok(())
-    }
-
     pub fn repo_update(&self) -> Result<()> {
         let repos = self.read_repos()?;
         if repos.is_empty() {
@@ -678,31 +680,46 @@ impl PkgUtil {
         Ok(())
     }
 
-    pub fn check_updates(&self) -> Result<()> {
+    // ---- Check updates ----
+
+    pub fn check_updates(&self) -> Result<Vec<UpdateInfo>> {
         let mut updates = Vec::new();
         for (name, installed) in &self.packages {
             let (_, latest_version, _) = self.resolve_package(name)?;
             if installed.version != latest_version {
-                updates.push((name.clone(), installed.version.clone(), latest_version));
+                updates.push(UpdateInfo {
+                    name: name.clone(),
+                    current: installed.version.clone(),
+                    latest: latest_version,
+                });
             }
         }
-        if updates.is_empty() {
-            println!("All packages are up to date.");
+        Ok(updates)
+    }
+
+    // ---- Search (text output) ----
+
+    pub fn search(&self, query: &str) -> Result<()> {
+        let results = self.search_json(query)?;
+        if results.is_empty() {
+            println!("No packages match '{}'", query);
         } else {
-            println!("Packages with updates available:");
-            for (name, current, latest) in &updates {
-                println!("  {} {} -> {}", name, current, latest);
+            println!("Search results for '{}':", query);
+            for result in &results {
+                println!("  {} {} ({}): {}", result.repo, result.name, result.version, result.description);
             }
         }
         Ok(())
     }
 
-    pub fn search(&self, query: &str) -> Result<()> {
+    // ---- Search (returns structured data for JSON) ----
+
+    pub fn search_json(&self, query: &str) -> Result<Vec<SearchResult>> {
         self.ensure_repo_cache_fresh()?;
         let cache_dir = self.cache_dir();
         if !cache_dir.exists() {
             println!("No cache found. Run 'pkgm repo update' first.");
-            return Ok(());
+            return Ok(Vec::new());
         }
         let query_lower = query.to_lowercase();
         let mut results = Vec::new();
@@ -723,28 +740,20 @@ impl PkgUtil {
                     .map(|d| d.to_lowercase().contains(&query_lower))
                     .unwrap_or(false);
                 if name_match || desc_match {
-                    results.push((
-                        repo_name.clone(),
-                        pkg_name,
-                        info.version,
-                        info.description.unwrap_or_default(),
-                    ));
+                    results.push(SearchResult {
+                        repo: repo_name.clone(),
+                        name: pkg_name,
+                        version: info.version,
+                        description: info.description.unwrap_or_default(),
+                    });
                 }
             }
         }
-
-        if results.is_empty() {
-            println!("No packages match '{}'", query);
-        } else {
-            println!("Search results for '{}':", query);
-            for (repo, name, version, desc) in results {
-                println!("  {} {} ({}): {}", repo, name, version, desc);
-            }
-        }
-        Ok(())
+        Ok(results)
     }
 
-    /// Look up a package in repository caches and return its URL, version, and optional checksum.
+    // ---- Resolve package ----
+
     pub fn resolve_package(&self, name: &str) -> Result<(String, String, Option<String>)> {
         self.ensure_repo_cache_fresh()?;
         let cache_dir = self.cache_dir();
@@ -767,8 +776,8 @@ impl PkgUtil {
         bail!("package '{}' not found in any repository", name);
     }
 
-    /// Verify installed packages: checks file existence only.
-    /// (pkg.checksum is the archive hash, not per-file, so we skip hashing.)
+    // ---- Verify ----
+
     pub fn verify(&self, package_name: &str) -> Result<()> {
         let packages = if package_name == "all" {
             self.packages.clone()
@@ -801,6 +810,8 @@ impl PkgUtil {
         Ok(())
     }
 
+    // ---- Checksum helpers ----
+
     fn compute_file_sha256(path: &Path) -> Result<String> {
         try_digest(path)
             .with_context(|| format!("failed to compute sha256 for {}", path.display()))
@@ -818,6 +829,8 @@ impl PkgUtil {
         }
         Ok(())
     }
+
+    // ---- Download with caching ----
 
     pub fn download_package(
         &self,
@@ -865,6 +878,50 @@ impl PkgUtil {
 
         debug!("Downloaded and cached: {}", cached_path.display());
         Ok(cached_path)
+    }
+
+    // ---- Config validation ----
+
+    /// Validates manifest syntax, URL reachability, and checksum correctness.
+    pub fn check_config(&self, config_path: &Path) -> Result<()> {
+        let content = fs::read_to_string(config_path)
+            .with_context(|| format!("read config {}", config_path.display()))?;
+        let manifest: Manifest = toml::from_str(&content)
+            .with_context(|| "invalid TOML syntax")?;
+
+        println!("Checking configuration: {}", config_path.display());
+        for (name, spec) in &manifest.packages {
+            // Check URL reachability (HEAD request for remote)
+            if is_remote_url(&spec.url) {
+                let resp = self.http.head(&spec.url).send();
+                match resp {
+                    Ok(r) if r.status().is_success() => println!("[OK] {}: URL reachable", name),
+                    Ok(r) => println!("[FAIL] {}: URL returned {}", name, r.status()),
+                    Err(e) => println!("[FAIL] {}: URL error - {}", name, e),
+                }
+            } else {
+                let local_path = Path::new(&spec.url);
+                if local_path.exists() {
+                    println!("[OK] {}: local file exists", name);
+                } else {
+                    println!("[FAIL] {}: local file not found", name);
+                }
+            }
+
+            // Check checksum if provided (only for local files)
+            if let Some(checksum) = &spec.checksum {
+                let path = Path::new(&spec.url);
+                if path.exists() {
+                    match self.verify_checksum(path, checksum) {
+                        Ok(()) => println!("[OK] {}: checksum OK", name),
+                        Err(e) => println!("[FAIL] {}: checksum mismatch - {}", name, e),
+                    }
+                } else {
+                    println!("[WARN] {}: checksum not verified (remote file)", name);
+                }
+            }
+        }
+        Ok(())
     }
 }
 

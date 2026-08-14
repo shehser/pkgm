@@ -22,6 +22,8 @@ struct Cli {
     dry_run: bool,
     #[arg(long, global = true, help = "Disable automatic repository update")]
     no_auto_update: bool,
+    #[arg(long, global = true, help = "Output in JSON format")]
+    json: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -84,6 +86,10 @@ enum Command {
         repos: bool,
     },
     Checkupdates,
+    CheckConfig {
+        #[arg(short, long, default_value = "pkgm.toml")]
+        config: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -95,6 +101,7 @@ enum RepoAction {
 }
 
 fn main() -> Result<()> {
+    env_logger::init();
     let cli = Cli::parse();
     let root = cli.root.unwrap_or_default();
 
@@ -260,8 +267,12 @@ fn main() -> Result<()> {
             util.db_open(false)?;
 
             if installed {
-                for (name, pkg) in &util.packages {
-                    println!("{} {}", name, pkg.version);
+                if cli.json {
+                    println!("{}", serde_json::to_string_pretty(&util.packages)?);
+                } else {
+                    for (name, pkg) in &util.packages {
+                        println!("{} {}", name, pkg.version);
+                    }
                 }
             } else if let Some(target) = list {
                 if util.db_find_package(&target) {
@@ -322,7 +333,21 @@ fn main() -> Result<()> {
         Command::Repo { action } => {
             let util = PkgUtil::new(root);
             match action {
-                RepoAction::List => util.repo_list()?,
+                RepoAction::List => {
+                    let repos = util.read_repos()?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&repos)?);
+                    } else {
+                        if repos.is_empty() {
+                            println!("No repositories configured.");
+                        } else {
+                            println!("Repositories:");
+                            for (name, url) in &repos {
+                                println!("  {}: {}", name, url);
+                            }
+                        }
+                    }
+                }
                 RepoAction::Add { name, url } => util.repo_add(&name, &url)?,
                 RepoAction::Remove { name } => util.repo_remove(&name)?,
                 RepoAction::Update => util.repo_update()?,
@@ -333,7 +358,12 @@ fn main() -> Result<()> {
         Command::Search { query } => {
             let mut util = PkgUtil::new(root);
             util.set_no_auto_update(cli.no_auto_update);
-            util.search(&query)?;
+            let results = util.search_json(&query)?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&results)?);
+            } else {
+                util.search(&query)?;
+            }
             Ok(())
         }
 
@@ -363,7 +393,25 @@ fn main() -> Result<()> {
             let mut util = PkgUtil::new(root);
             util.set_no_auto_update(cli.no_auto_update);
             util.db_open(false)?;
-            util.check_updates()?;
+            let updates = util.check_updates()?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&updates)?);
+            } else {
+                if updates.is_empty() {
+                    println!("All packages are up to date.");
+                } else {
+                    println!("Updates available:");
+                    for update in &updates {
+                        println!("  {} {} -> {}", update.name, update.current, update.latest);
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        Command::CheckConfig { config } => {
+            let util = PkgUtil::new(root);
+            util.check_config(&config)?;
             Ok(())
         }
     }
