@@ -13,8 +13,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tar::{Archive, Entry, EntryType};
 use users::{get_group_by_gid, get_user_by_uid};
 use sha256::try_digest;
-use crate::metadata::{parse_package_name, InstalledPkg, PkgMetadata, Manifest, ManifestPkg, RepoIndex};
+use crate::metadata::{parse_package_name, InstalledPkg, PkgMetadata, Manifest, ManifestPkg, RepoIndex, RepoPkg};
 use tempfile::NamedTempFile;
+use std::cell::RefCell;
 
 use log::{debug, warn};
 
@@ -61,6 +62,7 @@ pub struct PkgUtil {
     _db_lock: Option<File>,
     pub dry_run: bool,
     pub no_auto_update: bool,
+    repo_cache: RefCell<Option<HashMap<String, RepoIndex>>>,
 }
 
 impl PkgUtil {
@@ -77,6 +79,7 @@ impl PkgUtil {
             _db_lock: None,
             dry_run: false,
             no_auto_update: false,
+            repo_cache: RefCell::new(None),
         }
     }
 
@@ -89,6 +92,7 @@ impl PkgUtil {
             _db_lock: None,
             dry_run: false,
             no_auto_update: self.no_auto_update,
+            repo_cache: RefCell::new(None),
         }
     }
 
@@ -98,6 +102,33 @@ impl PkgUtil {
 
     pub fn set_no_auto_update(&mut self, val: bool) {
         self.no_auto_update = val;
+    }
+
+    /// Загрузка и кэширование индексов репозиториев в оперативку
+    fn load_repo_indices(&self) -> Result<HashMap<String, RepoIndex>> {
+        if let Some(ref cache) = *self.repo_cache.borrow() {
+            return Ok(cache.clone());
+        }
+
+        let cache_dir = self.cache_dir();
+        let mut map = HashMap::new();
+
+        if cache_dir.exists() {
+            for entry in fs::read_dir(&cache_dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) == Some("json") {
+                    let repo_name = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+                    let content = fs::read_to_string(&path)?;
+                    if let Ok(index) = serde_json::from_str::<RepoIndex>(&content) {
+                        map.insert(repo_name, index);
+                    }
+                }
+            }
+        }
+
+        *self.repo_cache.borrow_mut() = Some(map.clone());
+        Ok(map)
     }
 
     pub fn db_open(&mut self, readonly: bool) -> Result<()> {
@@ -579,6 +610,7 @@ impl PkgUtil {
         } else {
             println!("Repo cache already empty.");
         }
+        *self.repo_cache.borrow_mut() = None;
         Ok(())
     }
 
@@ -624,6 +656,7 @@ impl PkgUtil {
         if cache_file.exists() {
             fs::remove_file(&cache_file)?;
         }
+        *self.repo_cache.borrow_mut() = None;
         println!("Repository '{}' removed.", name);
         Ok(())
     }
@@ -660,6 +693,7 @@ impl PkgUtil {
         fs::write(self.cache_timestamp_path(), now.to_string())
             .context("write cache timestamp")?;
 
+        *self.repo_cache.borrow_mut() = None;
         Ok(())
     }
 
@@ -694,24 +728,15 @@ impl PkgUtil {
     }
 
     pub fn search_json(&self, query: &str) -> Result<Vec<SearchResult>> {
-        let cache_dir = self.cache_dir();
-        if !cache_dir.exists() {
+        let indices = self.load_repo_indices()?;
+        if indices.is_empty() {
             println!("No cache found. Run 'pkgm repo update' first.");
             return Ok(Vec::new());
         }
         let query_lower = query.to_lowercase();
         let mut results = Vec::new();
 
-        for entry in fs::read_dir(&cache_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("json") {
-                continue;
-            }
-            let repo_name = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
-            let content = fs::read_to_string(&path)?;
-            let index: RepoIndex = serde_json::from_str(&content)
-                .with_context(|| format!("parse {}", path.display()))?;
+        for (repo_name, index) in indices {
             for (pkg_name, info) in index.packages {
                 let name_match = pkg_name.to_lowercase().contains(&query_lower);
                 let desc_match = info.description.as_ref()
@@ -733,19 +758,11 @@ impl PkgUtil {
     // ---- Resolve package ----
 
     pub fn resolve_package(&self, name: &str) -> Result<(String, String, Option<String>)> {
-        let cache_dir = self.cache_dir();
-        if !cache_dir.exists() {
+        let indices = self.load_repo_indices()?;
+        if indices.is_empty() {
             bail!("repository cache not found. Run 'pkgm repo update'.");
         }
-        for entry in fs::read_dir(&cache_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("json") {
-                continue;
-            }
-            let content = fs::read_to_string(&path)?;
-            let index: RepoIndex = serde_json::from_str(&content)
-                .with_context(|| format!("parse {}", path.display()))?;
+        for index in indices.values() {
             if let Some(pkg) = index.packages.get(name) {
                 return Ok((pkg.url.clone(), pkg.version.clone(), pkg.checksum.clone()));
             }
@@ -925,23 +942,11 @@ impl PkgUtil {
     pub(crate) fn get_available_versions(&self, name: &str) -> Vec<semver::Version> {
         use semver::Version;
         let mut versions = Vec::new();
-        let cache_dir = self.cache_dir();
-        if !cache_dir.exists() {
-            return versions;
-        }
-        if let Ok(entries) = std::fs::read_dir(&cache_dir) {
-            for entry in entries.filter_map(|e| e.ok()) {
-                let path = entry.path();
-                if path.extension().and_then(|s| s.to_str()) != Some("json") {
-                    continue;
-                }
-                if let Ok(content) = std::fs::read_to_string(&path) {
-                    if let Ok(index) = serde_json::from_str::<crate::metadata::RepoIndex>(&content) {
-                        if let Some(pkg) = index.packages.get(name) {
-                            if let Ok(ver) = Version::parse(&pkg.version) {
-                                versions.push(ver);
-                            }
-                        }
+        if let Ok(indices) = self.load_repo_indices() {
+            for index in indices.values() {
+                if let Some(pkg) = index.packages.get(name) {
+                    if let Ok(ver) = Version::parse(&pkg.version) {
+                        versions.push(ver);
                     }
                 }
             }
@@ -951,20 +956,12 @@ impl PkgUtil {
         versions
     }
 
-    pub(crate) fn get_package_info(&self, name: &str) -> Result<crate::metadata::RepoPkg> {
-        
-        let cache_dir = self.cache_dir();
-        if !cache_dir.exists() {
+    pub(crate) fn get_package_info(&self, name: &str) -> Result<RepoPkg> {
+        let indices = self.load_repo_indices()?;
+        if indices.is_empty() {
             bail!("repository cache not found");
         }
-        for entry in std::fs::read_dir(&cache_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("json") {
-                continue;
-            }
-            let content = std::fs::read_to_string(&path)?;
-            let index: crate::metadata::RepoIndex = serde_json::from_str(&content)?;
+        for index in indices.values() {
             if let Some(pkg) = index.packages.get(name) {
                 return Ok(pkg.clone());
             }

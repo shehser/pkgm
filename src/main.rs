@@ -120,9 +120,11 @@ fn main() -> Result<()> {
             let mut resolved = Vec::new();
             for package in &packages {
                 if package.exists() {
-                    let (_name, ver) = metadata::parse_package_name(
-                        package.file_name().unwrap_or_default().to_str().unwrap_or("")
-                    );
+                    let file_name = package
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .ok_or_else(|| anyhow::anyhow!("Invalid package file name"))?;
+                    let (_name, ver) = metadata::parse_package_name(file_name);
                     resolved.push((package.clone(), None, false, ver, None));
                 } else {
                     let name = package.to_string_lossy().to_string();
@@ -180,7 +182,9 @@ fn main() -> Result<()> {
 
             let mut downloaded_paths = Vec::new();
             for handle in handles {
-                let result = handle.join().unwrap();
+                let result = handle
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("Thread panicked during download"))?;
                 downloaded_paths.push(result?);
             }
 

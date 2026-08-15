@@ -36,7 +36,7 @@ pub struct ManifestPkg {
     pub checksum: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct RepoPkg {
     pub version: String,
     pub description: Option<String>,
@@ -46,7 +46,7 @@ pub struct RepoPkg {
     pub dependencies: HashMap<String, String>, 
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct RepoIndex {
     pub packages: HashMap<String, RepoPkg>,
 }
