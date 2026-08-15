@@ -1,3 +1,6 @@
+// Copyright (C) 2026 Yersultan Muapyqov
+// SPDX-License-Identifier: GPL-2.0
+
 use anyhow::{Result, bail};
 use semver::{Version, VersionReq};
 use std::collections::{HashMap, HashSet};
