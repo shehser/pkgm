@@ -3,12 +3,14 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::thread;
 
 mod metadata;
 mod pkgutil;
+mod resolver;
 
 use metadata::InstalledPkg;
 use pkgutil::PkgUtil;
@@ -144,19 +146,36 @@ fn main() -> Result<()> {
                 return Ok(());
             }
 
-            // Parallel download remote packages
-            let mut handles = Vec::new();
-            for (_idx, (_, remote_info, _, _, name_opt)) in resolved.iter().enumerate() {
-                if let Some((url, ver, checksum_opt)) = remote_info {
-                    let name = name_opt.as_ref().unwrap().clone();
-                    let url = url.clone();
-                    let ver = ver.clone();
-                    let checksum_opt = checksum_opt.clone();
-                    let util_clone = util.clone_for_download();
-                    handles.push(thread::spawn(move || {
-                        util_clone.download_package(&url, &name, &ver, checksum_opt.as_deref())
-                    }));
+            // Resolve dependencies for all requested packages
+            let mut root_packages = HashMap::new();
+            for (_, remote_info, _, ver, name_opt) in &resolved {
+                if let Some((_, _, _)) = remote_info {
+                    if let Some(name) = name_opt {
+                        root_packages.insert(name.clone(), ver.clone());
+                    }
                 }
+            }
+
+            let all_packages = util.resolve_packages(&root_packages)?;
+
+            // Collect all package names and versions for download
+            let mut packages_to_install = Vec::new();
+            for (name, version) in &all_packages {
+                let (url, _, checksum_opt) = util.resolve_package(name)?;
+                packages_to_install.push((name.clone(), version.to_string(), url, checksum_opt));
+            }
+
+            // Parallel download all packages
+            let mut handles = Vec::new();
+            for (name, version, url, checksum_opt) in &packages_to_install {
+                let name = name.clone();
+                let version = version.clone();
+                let url = url.clone();
+                let checksum_opt = checksum_opt.clone();
+                let util_clone = util.clone_for_download();
+                handles.push(thread::spawn(move || {
+                    util_clone.download_package(&url, &name, &version, checksum_opt.as_deref())
+                }));
             }
 
             let mut downloaded_paths = Vec::new();
@@ -165,20 +184,11 @@ fn main() -> Result<()> {
                 downloaded_paths.push(result?);
             }
 
-            let mut pkg_paths = Vec::new();
-            let mut download_idx = 0;
-            for (package, remote_info, _, _, _) in resolved {
-                if remote_info.is_some() {
-                    pkg_paths.push(downloaded_paths[download_idx].clone());
-                    download_idx += 1;
-                } else {
-                    pkg_paths.push(package.clone());
-                }
-            }
-
+            // Install all packages
             let mut any_installed = false;
-            for pkg_path in pkg_paths {
-                let (meta, files) = util.pkg_open(&pkg_path)?;
+            for (idx, (_name, _version, _, _)) in packages_to_install.iter().enumerate() {
+                let pkg_path = &downloaded_paths[idx];
+                let (meta, files) = util.pkg_open(pkg_path)?;
                 let name = meta.name.clone();
 
                 let already = util.db_find_package(&name);
@@ -199,7 +209,7 @@ fn main() -> Result<()> {
                 if upgrade {
                     util.db_remove_package(&name);
                 }
-                util.pkg_install(&pkg_path)?;
+                util.pkg_install(pkg_path)?;
                 util.db_add_package(InstalledPkg {
                     name: meta.name.clone(),
                     version: meta.version,
@@ -209,7 +219,7 @@ fn main() -> Result<()> {
                 });
 
                 if pkg_path.starts_with(std::env::temp_dir()) {
-                    let _ = fs::remove_file(&pkg_path);
+                    let _ = fs::remove_file(pkg_path);
                 }
 
                 println!("Installed {}", meta.name);

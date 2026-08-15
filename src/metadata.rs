@@ -42,6 +42,8 @@ pub struct RepoPkg {
     pub description: Option<String>,
     pub url: String,
     pub checksum: Option<String>,
+    #[serde(default)]
+    pub dependencies: HashMap<String, String>, 
 }
 
 #[derive(Debug, Deserialize)]

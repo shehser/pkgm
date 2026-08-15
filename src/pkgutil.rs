@@ -548,7 +548,7 @@ impl PkgUtil {
         self.root.join(REPOS_FILE)
     }
 
-    fn cache_dir(&self) -> PathBuf {
+    pub(crate) fn cache_dir(&self) -> PathBuf {
         self.root.join(CACHE_DIR)
     }
 
@@ -892,6 +892,84 @@ impl PkgUtil {
             }
         }
         Ok(())
+    }
+
+    // ---- Dependency resolution (uses resolver module) ----
+
+    pub fn resolve_dependencies(&self, name: &str, version: &str) -> Result<HashMap<String, semver::Version>> {
+        crate::resolver::resolve_dependencies(self, name, version)
+    }
+
+    /// Resolve all dependencies for a list of packages, merging the results.
+    pub fn resolve_packages(&self, packages: &HashMap<String, String>) -> Result<HashMap<String, semver::Version>> {
+        let mut resolved = HashMap::new();
+        for (name, version) in packages {
+            let deps = self.resolve_dependencies(name, version)?;
+            for (dep_name, dep_ver) in deps {
+                if let Some(existing) = resolved.get(&dep_name) {
+                    if *existing != dep_ver {
+                        bail!(
+                            "Version conflict for {}: {} vs {}",
+                            dep_name, existing, dep_ver
+                        );
+                    }
+                } else {
+                    resolved.insert(dep_name, dep_ver);
+                }
+            }
+        }
+        Ok(resolved)
+    }
+
+    // Methods used by resolver
+    pub(crate) fn get_available_versions(&self, name: &str) -> Vec<semver::Version> {
+        use semver::Version;
+        let mut versions = Vec::new();
+        let cache_dir = self.cache_dir();
+        if !cache_dir.exists() {
+            return versions;
+        }
+        if let Ok(entries) = std::fs::read_dir(&cache_dir) {
+            for entry in entries.filter_map(|e| e.ok()) {
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                    continue;
+                }
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    if let Ok(index) = serde_json::from_str::<crate::metadata::RepoIndex>(&content) {
+                        if let Some(pkg) = index.packages.get(name) {
+                            if let Ok(ver) = Version::parse(&pkg.version) {
+                                versions.push(ver);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        versions.sort();
+        versions.dedup();
+        versions
+    }
+
+    pub(crate) fn get_package_info(&self, name: &str) -> Result<crate::metadata::RepoPkg> {
+        
+        let cache_dir = self.cache_dir();
+        if !cache_dir.exists() {
+            bail!("repository cache not found");
+        }
+        for entry in std::fs::read_dir(&cache_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let content = std::fs::read_to_string(&path)?;
+            let index: crate::metadata::RepoIndex = serde_json::from_str(&content)?;
+            if let Some(pkg) = index.packages.get(name) {
+                return Ok(pkg.clone());
+            }
+        }
+        bail!("Package '{}' not found in any repository", name);
     }
 }
 
