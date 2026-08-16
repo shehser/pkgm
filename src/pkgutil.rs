@@ -15,12 +15,13 @@ use crate::metadata::{parse_package_name, InstalledPkg, PkgMetadata};
 use tempfile::NamedTempFile;
 use log::debug;
 
-const DB_JSON: &str = "db/pkgdb.json";
-const DB_LOCK: &str = "db/pkgdb.lock";
+const DB_JSON: &str = "var/lib/pkgm/pkgdb.json";
+const DB_LOCK: &str = "var/lib/pkgm/pkgdb.lock";
 const META_FILE: &str = "metadata.json";
 const LDCONFIG: &str = "/usr/bin/ldconfig";
-const REPO_FILE: &str = "repo.txt";
-const CACHE_DIR: &str = "cache/pkgm";
+const REPO_FILE: &str = "etc/pkgm/repo.txt";
+const CACHE_DIR: &str = "var/cache/pkgm";
+const REPO_CACHE: &str = "var/cache/pkgm/repo.json";
 const HTTP_TIMEOUT_SECS: u64 = 30;
 
 pub type Packages = HashMap<String, InstalledPkg>;
@@ -37,6 +38,7 @@ impl PkgUtil {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         let http = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
+            .use_preconfigured_tls(webpki_roots::TLS_SERVER_ROOTS)
             .build()
             .unwrap_or_else(|_| reqwest::blocking::Client::new());
         Self {
@@ -52,8 +54,6 @@ impl PkgUtil {
         self.dry_run = dry;
     }
 
-    /// Open package database with appropriate lock.
-    /// Shared lock for readonly, exclusive for writes.
     pub fn db_open(&mut self, readonly: bool) -> Result<()> {
         let path = self.root.join(DB_JSON);
         if let Some(parent) = path.parent() {
@@ -75,17 +75,18 @@ impl PkgUtil {
 
         if path.exists() {
             let f = File::open(&path)?;
-            self.packages = serde_json::from_reader(BufReader::new(f))?;
+            self.packages = serde_json::from_reader(BufReader::new(f)).unwrap_or_default();
         } else {
             self.packages.clear();
         }
         Ok(())
     }
 
-    /// Atomic database commit using temporary file.
     pub fn db_commit(&self) -> Result<()> {
         let path = self.root.join(DB_JSON);
-        fs::create_dir_all(path.parent().unwrap())?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
         let tmp = NamedTempFile::new_in(path.parent().unwrap())?;
         serde_json::to_writer_pretty(tmp.as_file(), &self.packages)?;
         tmp.persist(&path)?;
@@ -100,7 +101,6 @@ impl PkgUtil {
         self.packages.insert(pkg.name.clone(), pkg);
     }
 
-    /// Remove package and delete files not owned by other packages.
     pub fn db_remove_package(&mut self, name: &str) {
         let Some(pkg) = self.packages.remove(name) else { return };
         let mut files = pkg.files;
@@ -114,7 +114,6 @@ impl PkgUtil {
         }
     }
 
-    /// Find conflicting files with installed packages or existing files on disk.
     pub fn db_find_conflicts(&self, name: &str, files: &BTreeSet<String>) -> BTreeSet<String> {
         let mut conflicts = BTreeSet::new();
         for (pkg, info) in &self.packages {
@@ -135,7 +134,6 @@ impl PkgUtil {
         conflicts
     }
 
-    /// Open archive and extract metadata + file list.
     pub fn pkg_open(&self, path: impl AsRef<Path>) -> Result<(PkgMetadata, BTreeSet<String>)> {
         let path = path.as_ref();
         let f = File::open(path)?;
@@ -169,12 +167,15 @@ impl PkgUtil {
         Ok((meta, files))
     }
 
-    /// Install package into managed root.
     pub fn pkg_install(&self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
         let f = File::open(path)?;
         let mut archive = Archive::new(GzDecoder::new(f));
-        let root = fs::canonicalize(&self.root)?;
+        let root = if self.root.exists() {
+            fs::canonicalize(&self.root)?
+        } else {
+            self.root.clone()
+        };
 
         for entry in archive.entries()? {
             let mut entry = entry?;
@@ -183,7 +184,6 @@ impl PkgUtil {
         Ok(())
     }
 
-    /// Unpack a single archive entry, rejecting unsafe paths.
     fn unpack_entry<R: Read>(&self, entry: &mut Entry<R>, dest_dir: &Path) -> Result<()> {
         let p = entry.path()?.to_path_buf();
         if p.to_string_lossy() == META_FILE {
@@ -204,7 +204,6 @@ impl PkgUtil {
         Ok(())
     }
 
-    /// Extract nested tarballs and remove intermediate file.
     fn extract_nested(&self, entry_path: &Path, dest_path: &Path) -> Result<()> {
         let s = entry_path.to_string_lossy();
         if !(s.ends_with(".tar.gz") || s.ends_with(".tgz")) {
@@ -212,7 +211,11 @@ impl PkgUtil {
         }
         let f = File::open(dest_path)?;
         let mut nested = Archive::new(GzDecoder::new(f));
-        let root = fs::canonicalize(&self.root)?;
+        let root = if self.root.exists() {
+            fs::canonicalize(&self.root)?
+        } else {
+            self.root.clone()
+        };
         for entry in nested.entries()? {
             let mut entry = entry?;
             self.unpack_entry(&mut entry, &root)?;
@@ -221,12 +224,12 @@ impl PkgUtil {
         Ok(())
     }
 
-    /// Run ldconfig inside managed root (no-op if missing).
     pub fn run_ldconfig(&self) -> Result<()> {
-        if !Path::new(LDCONFIG).exists() {
+        let ldconfig_path = self.root.join(LDCONFIG.trim_start_matches('/'));
+        if !ldconfig_path.exists() {
             return Ok(());
         }
-        let status = Command::new(LDCONFIG)
+        let status = Command::new(&ldconfig_path)
             .arg("-r")
             .arg(&self.root)
             .status()?;
@@ -236,7 +239,6 @@ impl PkgUtil {
         Ok(())
     }
 
-    /// Safe path removal using trimmed path to avoid root escape.
     fn remove_path(&self, file: &str) {
         let trimmed = file.trim_start_matches(['.', '/']);
         if trimmed.is_empty() {
@@ -266,82 +268,181 @@ impl PkgUtil {
     }
 
     pub fn repo_add(&self, url: &str) -> Result<()> {
-        fs::write(self.repo_path(), url)?;
-        Ok(())
-    }
-
-    pub fn repo_remove(&self) -> Result<()> {
-        if self.repo_path().exists() {
-            fs::remove_file(self.repo_path())?;
+        let mut repos = self.repo_list()?;
+        let trimmed_url = url.trim().trim_end_matches('/').to_string();
+        if !repos.contains(&trimmed_url) {
+            repos.push(trimmed_url);
+            if let Some(parent) = self.repo_path().parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(self.repo_path(), repos.join("\n"))?;
         }
         Ok(())
     }
 
-    pub fn repo_list(&self) -> Result<Option<String>> {
+    pub fn repo_remove(&self, url: &str) -> Result<()> {
+        let repos = self.repo_list()?;
+        let trimmed_target = url.trim().trim_end_matches('/');
+        let updated: Vec<String> = repos.into_iter().filter(|r| r != trimmed_target).collect();
+
+        if updated.is_empty() {
+            if self.repo_path().exists() {
+                fs::remove_file(self.repo_path())?;
+            }
+        } else {
+            fs::write(self.repo_path(), updated.join("\n"))?;
+        }
+        Ok(())
+    }
+
+    pub fn repo_list(&self) -> Result<Vec<String>> {
         if !self.repo_path().exists() {
-            return Ok(None);
+            return Ok(Vec::new());
         }
         let content = fs::read_to_string(self.repo_path())?;
-        Ok(Some(content.trim().to_string()))
+        let repos = content
+            .lines()
+            .map(|l| l.trim().trim_end_matches('/').to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+        Ok(repos)
     }
 
-    // ---- Package resolution ----
-
-    /// Resolve package from repository: returns (version, url, checksum)
-    pub fn resolve_package(&self, name: &str) -> Result<(String, String, Option<String>)> {
-        let repo_url = self.repo_list()?
-            .ok_or_else(|| anyhow::anyhow!("no repository configured"))?;
-
-        let resp = self.http.get(&format!("{}/index.json", repo_url)).send()?;
-        if !resp.status().is_success() {
-            bail!("failed to fetch index from {}", repo_url);
+    pub fn repo_update(&self) -> Result<()> {
+        let repos = self.repo_list()?;
+        if repos.is_empty() {
+            return Ok(());
         }
-        let index: HashMap<String, serde_json::Value> = serde_json::from_reader(resp.text()?.as_bytes())?;
-        let pkg_info = index.get(name)
-            .ok_or_else(|| anyhow::anyhow!("package {} not found", name))?;
-        let version = pkg_info["version"].as_str().unwrap_or("0.0.1").to_string();
-        let url = format!("{}/{}-{}.tar.gz", repo_url, name, version);
+
+        let mut combined_index: HashMap<String, serde_json::Value> = HashMap::new();
+        let mut total_pkgs = 0;
+
+        for repo_url in repos {
+            let index_url = format!("{}/index.json", repo_url);
+            let resp = match self.http.get(&index_url).send() {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("Warning: Failed to fetch {}: {}", index_url, e);
+                    continue;
+                }
+            };
+
+            if !resp.status().is_success() {
+                eprintln!("Warning: HTTP {} for {}", resp.status(), index_url);
+                continue;
+            }
+
+            let text = match resp.text() {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("Warning: Failed to read response from {}: {}", index_url, e);
+                    continue;
+                }
+            };
+
+            let json: serde_json::Value = match serde_json::from_str(&text) {
+                Ok(j) => j,
+                Err(e) => {
+                    eprintln!("Warning: Invalid JSON from {}: {}", index_url, e);
+                    continue;
+                }
+            };
+
+            let packages = if let Some(pkgs) = json.get("packages") {
+                pkgs.as_object()
+            } else {
+                json.as_object()
+            };
+
+            if let Some(pkgs) = packages {
+                for (name, val) in pkgs {
+                    combined_index.insert(name.clone(), val.clone());
+                    total_pkgs += 1;
+                }
+            }
+        }
+
+        let cache_path = self.root.join(REPO_CACHE);
+        if let Some(parent) = cache_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let mut final_map = HashMap::new();
+        final_map.insert("packages", serde_json::to_value(&combined_index)?);
+        fs::write(&cache_path, serde_json::to_string_pretty(&final_map)?)?;
+
+        println!("Repository cache updated ({} packages loaded)", total_pkgs);
+        Ok(())
+    }
+
+    pub fn resolve_package(&self, name: &str) -> Result<(String, String, Option<String>)> {
+        let cache_path = self.root.join(REPO_CACHE);
+        if !cache_path.exists() {
+            bail!("Repository cache not found. Run 'pkgm repo update'.");
+        }
+
+        let content = fs::read_to_string(&cache_path)?;
+        let index: serde_json::Value = serde_json::from_str(&content)?;
+
+        let packages = index.get("packages")
+            .and_then(|p| p.as_object())
+            .ok_or_else(|| anyhow::anyhow!("Invalid repository cache format"))?;
+
+        let pkg_info = packages.get(name)
+            .ok_or_else(|| anyhow::anyhow!("Package '{}' not found in repositories", name))?;
+
+        let version = pkg_info["version"].as_str()
+            .ok_or_else(|| anyhow::anyhow!("Version missing for {}", name))?
+            .to_string();
+
+        let url = pkg_info["url"].as_str()
+            .ok_or_else(|| anyhow::anyhow!("URL missing for {}", name))?
+            .to_string();
+
         let checksum = pkg_info["checksum"].as_str().map(|s| s.to_string());
+
         Ok((version, url, checksum))
     }
 
-    // ---- Search ----
-
     pub fn search(&self, query: &str) -> Result<Vec<(String, String, String)>> {
-        let repo_url = self.repo_list()?
-            .ok_or_else(|| anyhow::anyhow!("no repository configured"))?;
-
-        let resp = self.http.get(&format!("{}/index.json", repo_url)).send()?;
-        if !resp.status().is_success() {
-            bail!("failed to fetch index");
+        let cache_path = self.root.join(REPO_CACHE);
+        if !cache_path.exists() {
+            bail!("Repository cache not found. Run 'pkgm repo update'.");
         }
-        let index: HashMap<String, serde_json::Value> = serde_json::from_reader(resp.text()?.as_bytes())?;
+
+        let content = fs::read_to_string(&cache_path)?;
+        let index: serde_json::Value = serde_json::from_str(&content)?;
+
+        let packages = match index.get("packages").and_then(|p| p.as_object()) {
+            Some(p) => p,
+            None => return Ok(Vec::new()),
+        };
+
         let mut results = Vec::new();
         let query_lower = query.to_lowercase();
-        for (name, info) in index {
+
+        for (name, info) in packages {
             if name.to_lowercase().contains(&query_lower) {
                 let version = info["version"].as_str().unwrap_or("0.0.1").to_string();
                 let desc = info["description"].as_str().unwrap_or("").to_string();
-                results.push((name, version, desc));
+                results.push((name.clone(), version, desc));
             }
         }
+
         Ok(results)
     }
-
-    // ---- Check updates ----
 
     pub fn check_updates(&self) -> Result<Vec<(String, String, String)>> {
         let mut updates = Vec::new();
         for (name, installed) in &self.packages {
-            let (latest_version, _, _) = self.resolve_package(name)?;
-            if installed.version != latest_version {
-                updates.push((name.clone(), installed.version.clone(), latest_version));
+            if let Ok((latest_version, _, _)) = self.resolve_package(name) {
+                if installed.version != latest_version {
+                    updates.push((name.clone(), installed.version.clone(), latest_version));
+                }
             }
         }
         Ok(updates)
     }
-
-    // ---- Cache management ----
 
     pub fn clean_cache(&self) -> Result<()> {
         let dir = self.root.join(CACHE_DIR);
@@ -350,8 +451,6 @@ impl PkgUtil {
         }
         Ok(())
     }
-
-    // ---- Download ----
 
     pub fn download_package(&self, url: &str, name: &str, version: &str) -> Result<PathBuf> {
         let cache_dir = self.root.join(CACHE_DIR).join("packages");
@@ -365,12 +464,11 @@ impl PkgUtil {
 
         let resp = self.http.get(url).send()?;
         if !resp.status().is_success() {
-            bail!("HTTP {}", resp.status());
+            bail!("HTTP {} for {}", resp.status(), url);
         }
         let bytes = resp.bytes()?;
         fs::write(&cached_path, &bytes)?;
         debug!("Downloaded and cached: {}", cached_path.display());
         Ok(cached_path)
     }
-
 }

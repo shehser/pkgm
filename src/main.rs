@@ -5,6 +5,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::fs;
 use std::path::PathBuf;
+
 mod metadata;
 mod pkgutil;
 
@@ -14,8 +15,8 @@ use pkgutil::PkgUtil;
 #[derive(Parser)]
 #[command(name = "pkgm", version, about = "simple package manager")]
 struct Cli {
-    #[arg(short, long, global = true)]
-    root: Option<PathBuf>,
+    #[arg(short, long, global = true, default_value = "/")]
+    root: PathBuf,
     #[arg(short = 'n', long, global = true)]
     dry_run: bool,
     #[arg(long, global = true)]
@@ -52,14 +53,15 @@ enum Command {
 #[derive(Subcommand)]
 enum RepoAction {
     Add { url: String },
-    Remove,
+    Remove { url: String },
     List,
+    Update,
 }
 
 fn main() -> Result<()> {
     env_logger::init();
     let cli = Cli::parse();
-    let root = cli.root.unwrap_or_default();
+    let root = cli.root;
 
     match cli.command {
         Command::Install { packages, upgrade, force } => {
@@ -67,11 +69,13 @@ fn main() -> Result<()> {
             util.set_dry_run(cli.dry_run);
             let dry = util.dry_run;
 
-            // Open DB once for all packages
             util.db_open(dry)?;
 
+            if !dry {
+                let _ = util.repo_update();
+            }
+
             for package in packages {
-                // Determine if local file or remote package
                 let (name, version, url, checksum) = if package.exists() {
                     let name = package.file_name().unwrap().to_str().unwrap().to_string();
                     let version = "0.0.1".to_string();
@@ -87,8 +91,7 @@ fn main() -> Result<()> {
                     continue;
                 }
 
-                // Download if remote URL
-                let pkg_path = if url.starts_with("http") {
+                let pkg_path = if url.starts_with("http://") || url.starts_with("https://") {
                     util.download_package(&url, &name, &version)?
                 } else {
                     PathBuf::from(&url)
@@ -102,7 +105,6 @@ fn main() -> Result<()> {
                     anyhow::bail!("{} already installed (use --upgrade)", name);
                 }
 
-                // Check conflicts with installed packages
                 let conflicts = util.db_find_conflicts(&name, &files);
                 if !conflicts.is_empty() && !force {
                     eprintln!("Conflicts for {}:", name);
@@ -116,7 +118,6 @@ fn main() -> Result<()> {
                     util.db_remove_package(&name);
                 }
 
-                // Install and add to database
                 util.pkg_install(&pkg_path)?;
                 util.db_add_package(InstalledPkg {
                     name: name.clone(),
@@ -126,7 +127,6 @@ fn main() -> Result<()> {
                     checksum,
                 });
 
-                // Cleanup temp file if downloaded
                 if pkg_path.starts_with(std::env::temp_dir()) {
                     let _ = fs::remove_file(&pkg_path);
                 }
@@ -134,7 +134,6 @@ fn main() -> Result<()> {
                 println!("Installed {} {}", name, version);
             }
 
-            // Commit changes and update dynamic linker
             if !dry {
                 util.db_commit()?;
                 util.run_ldconfig()?;
@@ -172,6 +171,7 @@ fn main() -> Result<()> {
 
         Command::Search { query } => {
             let util = PkgUtil::new(root);
+            let _ = util.repo_update();
             let results = util.search(&query)?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&results)?);
@@ -186,6 +186,7 @@ fn main() -> Result<()> {
         Command::Checkupdates => {
             let mut util = PkgUtil::new(root);
             util.db_open(false)?;
+            let _ = util.repo_update();
             let updates = util.check_updates()?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&updates)?);
@@ -208,24 +209,24 @@ fn main() -> Result<()> {
                     util.repo_add(&url)?;
                     println!("Repository added: {}", url);
                 }
-                RepoAction::Remove => {
-                    util.repo_remove()?;
-                    println!("Repository removed");
+                RepoAction::Remove { url } => {
+                    util.repo_remove(&url)?;
+                    println!("Repository removed: {}", url);
                 }
                 RepoAction::List => {
-                    if let Some(url) = util.repo_list()? {
-                        if cli.json {
-                            println!("{{\"repo\": \"{}\"}}", url);
-                        } else {
-                            println!("{}", url);
-                        }
+                    let repos = util.repo_list()?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&repos)?);
+                    } else if repos.is_empty() {
+                        println!("No repositories configured");
                     } else {
-                        if cli.json {
-                            println!("null");
-                        } else {
-                            println!("No repository configured");
+                        for repo in repos {
+                            println!("{}", repo);
                         }
                     }
+                }
+                RepoAction::Update => {
+                    util.repo_update()?;
                 }
             }
             Ok(())

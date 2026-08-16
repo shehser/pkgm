@@ -21,7 +21,6 @@ pub struct InstalledPkg {
     pub checksum: Option<String>,
 }
 
-/// Parse name and version from filename: name-version.tar.gz
 pub fn parse_package_name(filename: &str) -> (String, String) {
     let file_name_only = Path::new(filename)
         .file_name()
