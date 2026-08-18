@@ -200,7 +200,7 @@ impl PkgUtil {
         entry.set_preserve_permissions(true);
         entry.set_preserve_mtime(true);
         entry.unpack(&dest)?;
-        self.extract_nested(&p, &dest)?;
+        //self.extract_nested(&p, &dest)?;
         Ok(())
     }
 
