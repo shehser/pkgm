@@ -186,13 +186,21 @@ impl PkgUtil {
             }
         }
         for f in files {
-            if self.root.join(f).exists() {
+            let trimmed = f.trim_start_matches(['.', '/']);
+            if trimmed.is_empty() {
+            continue;
+            }
+            let full_path = self.root.join(trimmed);
+        
+            if full_path.exists() && !full_path.is_dir() {
                 conflicts.insert(f.clone());
             }
-        }
-        if let Some(owned) = self.packages.get(name) {
-            for f in &owned.files {
-                conflicts.remove(f);
+        
+
+            if let Some(owned) = self.packages.get(name) {
+                for f in &owned.files {
+                    conflicts.remove(f);
+                }
             }
         }
         conflicts
