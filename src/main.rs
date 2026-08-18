@@ -3,7 +3,6 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use std::fs;
 use std::path::PathBuf;
 
 mod metadata;
@@ -76,62 +75,49 @@ fn main() -> Result<()> {
             }
 
             for package in packages {
-                let (name, version, url, checksum) = if package.exists() {
-                    let name = package.file_name().unwrap().to_str().unwrap().to_string();
-                    let version = "0.0.1".to_string();
-                    (name, version, package.to_string_lossy().to_string(), None)
-                } else {
-                    let name = package.to_string_lossy().to_string();
-                    let (version, url, checksum) = util.resolve_package(&name)?;
-                    (name, version, url, checksum)
-                };
-
                 if dry {
-                    println!("[DRY RUN] Would install {} {}", name, version);
+                    println!("[DRY RUN] Would install {}", package.display());
                     continue;
                 }
 
-                let pkg_path = if url.starts_with("http://") || url.starts_with("https://") {
-                    util.download_package(&url, &name, &version)?
-                } else {
-                    PathBuf::from(&url)
-                };
+                let name = package.to_string_lossy().to_string();
 
-                let (meta, files) = util.pkg_open(&pkg_path)?;
-                let name = meta.name;
-                let already = util.db_find_package(&name);
+                if package.exists() {
+                    let (meta, files) = util.pkg_open(&package)?;
+                    let name = meta.name;
+                    let version = "0.0.1".to_string();
+                    let already = util.db_find_package(&name);
 
-                if already && !upgrade {
-                    anyhow::bail!("{} already installed (use --upgrade)", name);
-                }
-
-                let conflicts = util.db_find_conflicts(&name, &files);
-                if !conflicts.is_empty() && !force {
-                    eprintln!("Conflicts for {}:", name);
-                    for f in &conflicts {
-                        eprintln!("  {}", f);
+                    if already && !upgrade {
+                        anyhow::bail!("{} already installed (use --upgrade)", name);
                     }
-                    anyhow::bail!("use --force");
+
+                    let conflicts = util.db_find_conflicts(&name, &files);
+                    if !conflicts.is_empty() && !force {
+                        eprintln!("Conflicts for {}:", name);
+                        for f in &conflicts {
+                            eprintln!("  {}", f);
+                        }
+                        anyhow::bail!("use --force");
+                    }
+
+                    if upgrade {
+                        util.db_remove_package(&name);
+                    }
+
+                    util.pkg_install(&package)?;
+                    util.db_add_package(InstalledPkg {
+                        name: name.clone(),
+                        version,
+                        description: meta.description,
+                        files,
+                        checksum: None,
+                    });
+
+                    println!("Installed {}", name);
+                } else {
+                    util.install_with_deps(&name, upgrade, force)?;
                 }
-
-                if upgrade {
-                    util.db_remove_package(&name);
-                }
-
-                util.pkg_install(&pkg_path)?;
-                util.db_add_package(InstalledPkg {
-                    name: name.clone(),
-                    version: version.clone(),
-                    description: meta.description,
-                    files,
-                    checksum,
-                });
-
-                if pkg_path.starts_with(std::env::temp_dir()) {
-                    let _ = fs::remove_file(&pkg_path);
-                }
-
-                println!("Installed {} {}", name, version);
             }
 
             if !dry {

@@ -50,6 +50,70 @@ impl PkgUtil {
         }
     }
 
+    pub fn install_with_deps(&mut self, name: &str, upgrade: bool, force: bool) -> Result<()> {
+        let (version, url, checksum) = self.resolve_package(name)?;
+        let deps = self.get_dependencies(name)?;
+        for dep in deps {
+            if !self.db_find_package(&dep) {
+                println!("Installing dependency: {}", dep);
+                self.install_with_deps(&dep, false, false)?;
+            }
+        }
+
+        let already = self.db_find_package(name);
+        if already && !upgrade {
+            bail!("{} already installed (use --upgrade)", name);
+        }
+
+        let pkg_path = self.download_package(&url, name, &version)?;
+        let (meta, files) = self.pkg_open(&pkg_path)?;
+
+        let conflicts = self.db_find_conflicts(name, &files);
+        if !conflicts.is_empty() && !force {
+            eprintln!("Conflicts for {}:", name);
+            for f in &conflicts {
+                eprintln!("  {}", f);
+            }
+            bail!("use --force");
+        }
+
+        if upgrade {
+            self.db_remove_package(name);
+        }
+
+        self.pkg_install(&pkg_path)?;
+        self.db_add_package(InstalledPkg {
+            name: name.to_string(),
+            version: version.clone(),
+            description: meta.description,
+            files,
+            checksum,
+        });
+
+        if pkg_path.starts_with(std::env::temp_dir()) {
+            let _ = std::fs::remove_file(&pkg_path);
+        }
+
+        println!("Installed {} {}", name, version);
+        Ok(())
+    }
+
+    pub fn get_dependencies(&self, name: &str) -> Result<Vec<String>> {
+        let cache_path = self.root.join(REPO_CACHE);
+        let content = fs::read_to_string(&cache_path)?;
+        let index: serde_json::Value = serde_json::from_str(&content)?;
+        let packages = index.get("packages").and_then(|p| p.as_object())
+            .ok_or_else(|| anyhow::anyhow!("Invalid repository cache format"))?;
+        let pkg_info = packages.get(name)
+            .ok_or_else(|| anyhow::anyhow!("Package '{}' not found", name))?;
+
+        let deps = pkg_info.get("dependencies")
+            .and_then(|d| d.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_else(Vec::new);
+        Ok(deps)
+    }
+
     pub fn set_dry_run(&mut self, dry: bool) {
         self.dry_run = dry;
     }
